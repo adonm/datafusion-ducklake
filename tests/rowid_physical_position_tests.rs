@@ -459,3 +459,113 @@ async fn small_single_row_group_file_unchanged() -> DataFusionResult<()> {
     assert_eq!(pairs, vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 9. rowid IN (...) prunes to the matching row groups and returns EXACTLY the
+//    requested rows (the BM25 point-lookup pattern). Rowids are chosen to span
+//    non-adjacent row groups (DuckDB row-group size 122_880): 5→rg0,
+//    130_000→rg1, 350_000→rg2, 599_999→last; rg3 is skipped, rg1/rg2 coalesce
+//    into one run. Proves pruning keeps rowid synthesis exact and that the
+//    post-scan filter drops the over-scanned rows.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rowid_in_list_returns_exactly_matching_rows() -> DataFusionResult<()> {
+    let temp = temp()?;
+    let path = temp.path().join("rowid_in.ducklake");
+    {
+        let conn = open(&path).map_err(common::to_datafusion_error)?;
+        conn.execute("CREATE TABLE c.t(i INTEGER);", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        // Single INSERT => one data file => row_id_start = 0 => rowid == i.
+        conn.execute(
+            &format!("INSERT INTO c.t SELECT i FROM range(0, {BIG}) t(i);"),
+            [],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    }
+
+    let ctx = split_ctx();
+    ctx.register_catalog("c", catalog(&path.to_string_lossy(), true)?);
+
+    let wanted = [5i64, 130_000, 350_000, 599_999];
+    let batches = ctx
+        .sql("SELECT rowid, i FROM c.main.t WHERE rowid IN (5, 130000, 350000, 599999)")
+        .await?
+        .collect()
+        .await?;
+
+    let mut got: Vec<(i64, i64)> = Vec::new();
+    for b in &batches {
+        let rid = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let v = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        for r in 0..b.num_rows() {
+            got.push((rid.value(r), v.value(r) as i64));
+        }
+    }
+    got.sort_unstable();
+    let expected: Vec<(i64, i64)> = wanted.iter().map(|&r| (r, r)).collect();
+    assert_eq!(
+        got, expected,
+        "rowid IN (...) must return exactly the requested rows with rowid == i"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 10. rowid pruning preserves the positional plan-shape invariant: the scan
+//     remains the direct child of FileRowNumberExec (per-partition seeds
+//     intact). A broken shape would desync positions and fail test 9, but this
+//     asserts the invariant explicitly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rowid_in_list_preserves_positional_plan_shape() -> DataFusionResult<()> {
+    let temp = temp()?;
+    let path = temp.path().join("rowid_in_plan.ducklake");
+    {
+        let conn = open(&path).map_err(common::to_datafusion_error)?;
+        conn.execute("CREATE TABLE c.t(i INTEGER);", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.execute(
+            &format!("INSERT INTO c.t SELECT i FROM range(0, {BIG}) t(i);"),
+            [],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    }
+
+    let ctx = split_ctx();
+    ctx.register_catalog("c", catalog(&path.to_string_lossy(), true)?);
+
+    let mut plan = String::new();
+    for b in ctx
+        .sql("EXPLAIN SELECT rowid, i FROM c.main.t WHERE rowid IN (5, 130000, 350000, 599999)")
+        .await?
+        .collect()
+        .await?
+    {
+        if let Some(c) = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
+            for r in 0..b.num_rows() {
+                plan.push_str(c.value(r));
+                plan.push('\n');
+            }
+        }
+    }
+    let lines: Vec<&str> = plan.lines().collect();
+    let frn = lines
+        .iter()
+        .position(|l| l.contains("FileRowNumberExec"))
+        .unwrap_or_else(|| panic!("plan has no FileRowNumberExec:\n{plan}"));
+    assert!(
+        lines
+            .get(frn + 1)
+            .is_some_and(|l| l.contains("DataSourceExec")),
+        "DataSourceExec must remain the direct child of FileRowNumberExec under \
+         rowid pruning:\n{plan}"
+    );
+    Ok(())
+}

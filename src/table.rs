@@ -1,7 +1,7 @@
 //! DuckLake table provider implementation
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Result;
@@ -31,6 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::ScalarValue;
 use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
 use datafusion::datasource::listing::PartitionedFile;
@@ -41,7 +42,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
@@ -129,6 +130,10 @@ struct FileReadConfig {
     /// Number of row groups in the file (`row_group_starts.len()`). Required to
     /// build a `ParquetAccessPlan` of the correct length.
     row_group_count: usize,
+    /// Total physical rows in the file (sum of every row group's `num_rows`).
+    /// Used to bound a synthesized file's rowid range `[row_id_start,
+    /// row_id_start + file_row_count)` when pruning row groups by rowid.
+    file_row_count: i64,
 }
 
 /// DuckLake table provider
@@ -737,6 +742,9 @@ impl DuckLakeTable {
             embedded_rowid_parquet_name,
             row_group_starts,
             row_group_count,
+            // `row_acc` accumulated every row group's `num_rows`, so it is the
+            // file's total physical row count.
+            file_row_count: row_acc,
         });
 
         {
@@ -828,6 +836,61 @@ impl DuckLakeTable {
         Ok((file_groups, partition_starts))
     }
 
+    /// Build positional scan partitions that read **only** the given row groups,
+    /// for a rowid-pruned scan. `selected` must be sorted, unique, non-empty,
+    /// and every index `< read_cfg.row_group_count`.
+    ///
+    /// Each maximal contiguous run of selected row groups becomes one
+    /// [`FileGroup`] (DataFusion partition) carrying a `Scan`/`Skip`
+    /// [`ParquetAccessPlan`], with `partition_starts[i]` set to the physical
+    /// position of that run's first row. Keeping each partition a contiguous run
+    /// (never an internal `Skip`) preserves the `FileRowNumberExec` invariant —
+    /// a partition emits one contiguous, in-order run of physical rows beginning
+    /// at its declared start — so rowid synthesis and positional delete
+    /// filtering remain correct under pruning.
+    fn build_pruned_row_group_partitions(
+        &self,
+        file: &DuckLakeFileData,
+        read_cfg: &FileReadConfig,
+        selected: &[usize],
+    ) -> DataFusionResult<(Vec<FileGroup>, Vec<i64>)> {
+        let resolved_path = self.resolve_file_path(file)?;
+        let file_size = validated_file_size(file.file_size_bytes, &resolved_path)?;
+        let footer_hint = file
+            .footer_size
+            .filter(|&s| s > 0)
+            .and_then(|s| usize::try_from(s).ok());
+        let n = read_cfg.row_group_count;
+
+        let make_pf = |access: ParquetAccessPlan| {
+            let mut pf = PartitionedFile::new(&resolved_path, file_size);
+            if let Some(hint) = footer_hint {
+                pf = pf.with_metadata_size_hint(hint);
+            }
+            pf.with_extensions(Arc::new(access))
+        };
+
+        let mut file_groups = Vec::new();
+        let mut partition_starts = Vec::new();
+        for (run_start, run_end) in contiguous_runs(selected) {
+            let row_groups: Vec<RowGroupAccess> = (0..n)
+                .map(|rg| {
+                    if rg >= run_start && rg <= run_end {
+                        RowGroupAccess::Scan
+                    } else {
+                        RowGroupAccess::Skip
+                    }
+                })
+                .collect();
+            file_groups.push(FileGroup::new(vec![make_pf(ParquetAccessPlan::new(
+                row_groups,
+            ))]));
+            partition_starts.push(read_cfg.row_group_starts[run_start]);
+        }
+
+        Ok((file_groups, partition_starts))
+    }
+
     /// Build a plan for a single file when the synthetic `rowid` column is in
     /// the projection. Always uses per-file scans because each file may have a
     /// different layout (embedded rowid vs. synthesized) and a distinct
@@ -843,6 +906,11 @@ impl DuckLakeTable {
         table_file: &DuckLakeTableFile,
         user_proj: &[usize],
         rowid_idx: usize,
+        // Sorted, de-duplicated rowids from a `rowid IN (…)` / `rowid = …`
+        // predicate on this scan, when present. Used to prune row groups (and
+        // skip whole files) that cannot contain any requested rowid. `None`
+        // means no such predicate — scan the whole file as before.
+        requested_rowids: Option<&[i64]>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
@@ -893,14 +961,49 @@ impl DuckLakeTable {
             physical_proj.clone()
         };
 
+        // Optional rowid-driven row-group pruning. Only synthesized
+        // (non-embedded) files can be pruned positionally — an embedded rowid is
+        // an arbitrary stored value, not derivable from physical position. The
+        // post-scan rowid filter (filters are reported `Inexact`) still
+        // guarantees correctness, so this only avoids reading row groups that
+        // provably contain no requested rowid; over-inclusion would just be
+        // slower, never wrong. Empty selection ⇒ this file holds none of the
+        // requested rowids, so emit nothing for it.
+        let pruned_partitions: Option<(Vec<FileGroup>, Vec<i64>)> =
+            match (requested_rowids, has_embedded, table_file.row_id_start) {
+                (Some(req), false, Some(row_id_start)) => {
+                    let selected = select_row_groups_for_rowids(
+                        req,
+                        row_id_start,
+                        file_cfg.file_row_count,
+                        &file_cfg.row_group_starts,
+                    );
+                    if selected.is_empty() {
+                        use datafusion::physical_plan::empty::EmptyExec;
+                        let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
+                        return Ok(Arc::new(EmptyExec::new(output_schema)));
+                    }
+                    Some(self.build_pruned_row_group_partitions(
+                        &table_file.file,
+                        &file_cfg,
+                        &selected,
+                    )?)
+                },
+                _ => None,
+            };
+
         let after_deletes: Arc<dyn ExecutionPlan> = if needs_position {
             // Positional path: row-group-aligned partitions + a non-repartition,
             // non-pruning source, so each partition emits a complete, contiguous,
             // in-order run of physical rows. No scan-level limit (it would drop
             // rows before delete filtering); DataFusion enforces LIMIT above.
-            let target_partitions = state.config().target_partitions();
-            let (file_groups, partition_starts) =
-                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+            let (file_groups, partition_starts) = match pruned_partitions {
+                Some(p) => p,
+                None => {
+                    let target_partitions = state.config().target_partitions();
+                    self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?
+                },
+            };
 
             let source = PositionalFileSource::wrap(Arc::new(
                 self.create_parquet_source(file_cfg.read_schema.clone()),
@@ -1062,8 +1165,10 @@ impl TableProvider for DuckLakeTable {
         // Filters are received here for informational purposes. DataFusion's optimizer
         // automatically pushes them down to the Parquet scanner for row group pruning and
         // page-level filtering since we declared support via supports_filters_pushdown().
-        // We mark them as Inexact, so DataFusion will reapply them after our scan.
-        _filters: &[Expr],
+        // We mark them as Inexact, so DataFusion will reapply them after our scan. We also
+        // mine a `rowid IN (…)` / `rowid = …` predicate from them to prune row groups on
+        // the row-lineage path (see `extract_requested_rowids`).
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Row-lineage detour: when the synthetic `rowid` column is projected,
@@ -1083,10 +1188,20 @@ impl TableProvider for DuckLakeTable {
                 .cloned()
                 .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
 
+            // Mine a rowid predicate once; reused to prune every file's scan.
+            let requested_rowids = extract_requested_rowids(filters);
+
             let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
             for tf in &self.table_files {
                 let exec = self
-                    .build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
+                    .build_exec_for_file_with_rowid(
+                        state,
+                        tf,
+                        &user_proj,
+                        rowid_idx,
+                        requested_rowids.as_deref(),
+                        limit,
+                    )
                     .await?;
                 execs.push(exec);
             }
@@ -1191,6 +1306,117 @@ fn combine_execution_plans(
     }
 }
 
+/// Collapse a sorted, unique list of indices into maximal contiguous
+/// `(start, end)` inclusive runs. `[0,2,3,4,7] → [(0,0),(2,4),(7,7)]`.
+fn contiguous_runs(selected: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < selected.len() {
+        let start = selected[i];
+        let mut end = start;
+        while i + 1 < selected.len() && selected[i + 1] == selected[i] + 1 {
+            end = selected[i + 1];
+            i += 1;
+        }
+        i += 1;
+        runs.push((start, end));
+    }
+    runs
+}
+
+/// Extract the rowids targeted by a `rowid IN (…)` / `rowid = …` predicate
+/// among `filters`, if present, as sorted, de-duplicated values.
+///
+/// Returns `None` when no usable rowid predicate is found — a negated `IN`, a
+/// non-integer literal, or a predicate on another column all yield `None`, in
+/// which case the caller scans without rowid pruning. Correctness never depends
+/// on this: the filters are reported `Inexact`, so DataFusion re-applies the
+/// predicate above the scan regardless. This only enables an I/O optimization.
+fn extract_requested_rowids(filters: &[Expr]) -> Option<Vec<i64>> {
+    for filter in filters {
+        if let Some(mut ids) = rowid_values_from_expr(filter) {
+            ids.sort_unstable();
+            ids.dedup();
+            return Some(ids);
+        }
+    }
+    None
+}
+
+/// Pull rowid literals from a single predicate, or `None` unless it is a
+/// positive equality / `IN` on the `rowid` column with integer literals.
+fn rowid_values_from_expr(expr: &Expr) -> Option<Vec<i64>> {
+    match expr {
+        Expr::InList(in_list) if !in_list.negated && is_rowid_column(&in_list.expr) => {
+            // Every element must be an integer literal; bail otherwise so we
+            // fall back to a full scan rather than mis-prune.
+            in_list.list.iter().map(literal_as_i64).collect()
+        },
+        Expr::BinaryExpr(be) if be.op == Operator::Eq => {
+            let val = if is_rowid_column(&be.left) {
+                literal_as_i64(&be.right)
+            } else if is_rowid_column(&be.right) {
+                literal_as_i64(&be.left)
+            } else {
+                None
+            };
+            val.map(|v| vec![v])
+        },
+        _ => None,
+    }
+}
+
+/// True if `expr` is a bare column reference named [`ROWID_COLUMN_NAME`].
+fn is_rowid_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(col) if col.name == ROWID_COLUMN_NAME)
+}
+
+/// Interpret an expression as an integer literal coerced to `i64`; anything
+/// else (NULL, non-integer, out-of-range u64) yields `None`.
+fn literal_as_i64(expr: &Expr) -> Option<i64> {
+    let Expr::Literal(scalar, ..) = expr else {
+        return None;
+    };
+    let v = match scalar {
+        ScalarValue::Int64(Some(v)) => *v,
+        ScalarValue::Int32(Some(v)) => *v as i64,
+        ScalarValue::Int16(Some(v)) => *v as i64,
+        ScalarValue::Int8(Some(v)) => *v as i64,
+        ScalarValue::UInt8(Some(v)) => *v as i64,
+        ScalarValue::UInt16(Some(v)) => *v as i64,
+        ScalarValue::UInt32(Some(v)) => *v as i64,
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok()?,
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// Map requested rowids to the sorted, unique set of row-group indices that may
+/// contain them in a synthesized file whose first physical row has rowid
+/// `row_id_start`. A rowid `r` sits at physical position `r - row_id_start`;
+/// its row group is the last one whose start is `<= pos`. Rowids outside this
+/// file's range `[row_id_start, row_id_start + file_row_count)` are ignored, so
+/// an empty result means the file holds none of the requested rowids.
+fn select_row_groups_for_rowids(
+    requested_sorted: &[i64],
+    row_id_start: i64,
+    file_row_count: i64,
+    row_group_starts: &[i64],
+) -> Vec<usize> {
+    let mut set = BTreeSet::new();
+    for &r in requested_sorted {
+        let pos = r - row_id_start;
+        if pos < 0 || pos >= file_row_count {
+            continue;
+        }
+        // `row_group_starts` is sorted and starts at 0, and `pos >= 0`, so
+        // `partition_point` is at least 1; the row group is the entry before it.
+        let idx = row_group_starts.partition_point(|&s| s <= pos) - 1;
+        set.insert(idx);
+    }
+    set.into_iter().collect()
+}
+
 /// Extract deleted row positions from a delete file RecordBatch
 ///
 /// Delete files have schema: (file_path: VARCHAR, pos: INT64)
@@ -1242,6 +1468,117 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::prelude::{col, lit};
+
+    // --- rowid predicate extraction ---
+
+    #[test]
+    fn extract_rowids_from_in_list_sorted_deduped() {
+        let f = col(ROWID_COLUMN_NAME)
+            .in_list(vec![lit(1_000_000i64), lit(100i64), lit(100i64)], false);
+        assert_eq!(extract_requested_rowids(&[f]), Some(vec![100, 1_000_000]));
+    }
+
+    #[test]
+    fn extract_rowids_from_equality_either_side() {
+        assert_eq!(
+            extract_requested_rowids(&[col(ROWID_COLUMN_NAME).eq(lit(42i64))]),
+            Some(vec![42])
+        );
+        // Literal on the left also recognized.
+        assert_eq!(
+            extract_requested_rowids(&[lit(7i64).eq(col(ROWID_COLUMN_NAME))]),
+            Some(vec![7])
+        );
+    }
+
+    #[test]
+    fn extract_rowids_picks_rowid_predicate_among_filters() {
+        let other = col("amount").gt(lit(10i64));
+        let rowid = col(ROWID_COLUMN_NAME).in_list(vec![lit(5i64)], false);
+        assert_eq!(
+            extract_requested_rowids(&[other, rowid]),
+            Some(vec![5]),
+            "should find the rowid predicate even when other filters precede it"
+        );
+    }
+
+    #[test]
+    fn extract_rowids_none_for_unprunable_predicates() {
+        // Negated IN: pruning would drop rows that must be returned.
+        assert_eq!(
+            extract_requested_rowids(&[col(ROWID_COLUMN_NAME).in_list(vec![lit(1i64)], true)]),
+            None
+        );
+        // Predicate on a different column.
+        assert_eq!(
+            extract_requested_rowids(&[col("id").in_list(vec![lit(1i64)], false)]),
+            None
+        );
+        // Non-integer literal in the list.
+        assert_eq!(
+            extract_requested_rowids(&[col(ROWID_COLUMN_NAME).in_list(vec![lit("x")], false)]),
+            None
+        );
+        // No filters at all.
+        assert_eq!(extract_requested_rowids(&[]), None);
+    }
+
+    // --- rowid -> row-group selection ---
+
+    #[test]
+    fn select_row_groups_maps_positions_and_dedupes() {
+        // 4 row groups of 100 rows each; file starts at global rowid 1000.
+        let starts = vec![0, 100, 200, 300];
+        let count = 400;
+        let start = 1000;
+        // pos 0 -> rg0, pos 150 -> rg1, pos 399 -> rg3; the two in rg1 collapse.
+        let req = vec![1000, 1150, 1199, 1399];
+        assert_eq!(
+            select_row_groups_for_rowids(&req, start, count, &starts),
+            vec![0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn select_row_groups_ignores_out_of_range_rowids() {
+        let starts = vec![0, 100];
+        let count = 200;
+        let start = 1000;
+        // 999 is before the file; 1200 is the first rowid past it; 1199 is the last.
+        assert_eq!(
+            select_row_groups_for_rowids(&[999, 1200, 5000], start, count, &starts),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            select_row_groups_for_rowids(&[1000, 1199], start, count, &starts),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn select_row_groups_boundary_lands_in_starting_group() {
+        // A rowid exactly at a row group's start position belongs to that group.
+        let starts = vec![0, 100, 200];
+        let count = 300;
+        assert_eq!(
+            select_row_groups_for_rowids(&[100], 0, count, &starts),
+            vec![1]
+        );
+    }
+
+    // --- contiguous run coalescing ---
+
+    #[test]
+    fn contiguous_runs_coalesces_adjacent_indices() {
+        assert_eq!(contiguous_runs(&[]), Vec::<(usize, usize)>::new());
+        assert_eq!(contiguous_runs(&[5]), vec![(5, 5)]);
+        assert_eq!(
+            contiguous_runs(&[0, 2, 3, 4, 7]),
+            vec![(0, 0), (2, 4), (7, 7)]
+        );
+        assert_eq!(contiguous_runs(&[0, 1, 2]), vec![(0, 2)]);
+    }
 
     #[test]
     fn test_validated_file_size_positive() {
