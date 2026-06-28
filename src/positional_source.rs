@@ -33,6 +33,7 @@ use datafusion::physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayFormatType, SortOrderPushdownResult};
+use datafusion_datasource::morsel::Morselizer;
 use object_store::ObjectStore;
 
 /// Wraps an inner `FileSource` (a configured `ParquetSource`) so DataFusion
@@ -66,6 +67,16 @@ impl FileSource for PositionalFileSource {
     ) -> DataFusionResult<Arc<dyn FileOpener>> {
         self.inner
             .create_file_opener(object_store, base_config, partition)
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DataFusionResult<Box<dyn Morselizer>> {
+        self.inner
+            .create_morselizer(object_store, base_config, partition)
     }
 
     fn table_schema(&self) -> &TableSchema {
