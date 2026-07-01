@@ -213,6 +213,56 @@ impl DataFileInfo {
     }
 }
 
+/// A positional delete file to register via [`MetadataWriter::set_delete_file`].
+/// Mirrors [`DataFileInfo`]; the parquet has the standard `(file_path, pos)`
+/// schema. Must be cumulative for its data file (all still-deleted positions),
+/// since at most one delete file is live per data file at a time.
+#[derive(Debug, Clone)]
+pub struct DeleteFileInfo {
+    /// Path to the delete file (relative to the table path, or absolute).
+    pub path: String,
+    /// Whether the path is relative to the table's path.
+    pub path_is_relative: bool,
+    /// Size of the delete file in bytes.
+    pub file_size_bytes: i64,
+    /// Size of the Parquet footer in bytes (read optimization hint).
+    pub footer_size: Option<i64>,
+    /// Number of deleted positions in this file.
+    pub delete_count: i64,
+}
+
+impl DeleteFileInfo {
+    /// Create a new delete-file info with a relative path.
+    ///
+    /// # Panics
+    /// Panics if `delete_count` is negative.
+    pub fn new(path: impl Into<String>, file_size_bytes: i64, delete_count: i64) -> Self {
+        assert!(
+            delete_count >= 0,
+            "delete_count must be non-negative, got {delete_count}"
+        );
+        Self {
+            path: path.into(),
+            path_is_relative: true,
+            file_size_bytes,
+            footer_size: None,
+            delete_count,
+        }
+    }
+
+    /// Set the footer size for read optimization.
+    pub fn with_footer_size(mut self, footer_size: i64) -> Self {
+        self.footer_size = Some(footer_size);
+        self
+    }
+
+    /// Mark this delete file as having an absolute path.
+    pub fn with_absolute_path(mut self) -> Self {
+        self.path_is_relative = false;
+        self
+    }
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {
@@ -367,6 +417,32 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds>;
+
+    /// Register a positional delete file for a single data file, superseding any
+    /// prior live delete file for it (at most one is live per data file).
+    ///
+    /// In one transaction: check that `expected_prev_delete_file` (the prior live
+    /// delete file's id, or `None`) and `base_snapshot` still match, else return
+    /// [`crate::DuckLakeError::Conflict`]; then end the prior delete file and
+    /// insert `delete`, which must carry the cumulative position set.
+    ///
+    /// Default: unsupported; backends override it.
+    #[allow(clippy::too_many_arguments)]
+    fn set_delete_file(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _data_file_id: i64,
+        _expected_prev_delete_file: Option<i64>,
+        _base_snapshot: i64,
+        _delete: &DeleteFileInfo,
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "set_delete_file is not supported by this metadata writer".to_string(),
+        ))
+    }
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
     /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.

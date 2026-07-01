@@ -355,6 +355,23 @@ impl DuckLakeTable {
         Ok((Arc::new(read_schema), name_mapping))
     }
 
+    /// Scan `data_file` and return the physical positions of rows matching
+    /// `predicate`, without applying delete files. These are the positions used
+    /// by a delete file's `pos` column and
+    /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
+    ///
+    /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
+    /// is a possible optimization. Only valid for insert-only files, where
+    /// `position = rowid - row_id_start`.
+    pub async fn resolve_positions(
+        &self,
+        _state: &dyn Session,
+        _data_file: &DuckLakeFileData,
+        _predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        todo!("resolve_positions is not yet implemented")
+    }
+
     /// Read a delete file and extract all deleted row positions
     ///
     /// The delete file is already associated with a specific data file via metadata.
