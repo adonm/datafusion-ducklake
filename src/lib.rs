@@ -87,7 +87,7 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
-pub use metadata_provider::MetadataProvider;
+pub use metadata_provider::{DuckLakeFileData, DuckLakeTableFile, MetadataProvider};
 pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
@@ -107,7 +107,8 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult, WriteSetupResult,
+    ColumnDef, CommitIds, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteResult,
+    WriteSetupResult,
 };
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres::PostgresMetadataWriter;
