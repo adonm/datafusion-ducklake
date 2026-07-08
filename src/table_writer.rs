@@ -44,6 +44,45 @@ pub struct DuckLakeTableWriter {
     max_row_group_bytes: Option<usize>,
 }
 
+#[derive(Debug)]
+struct TableFileLocation {
+    file_dir: String,
+    catalog_path: String,
+    path_is_relative: bool,
+}
+
+fn table_file_location(
+    catalog_id: Option<i64>,
+    base_key_path: &str,
+    schema_name: &str,
+    table_name: &str,
+    file_name: &str,
+) -> Result<TableFileLocation> {
+    let scoped_base = match catalog_id {
+        Some(id) => join_paths(base_key_path, &format!("cat_{id}"))?,
+        None => base_key_path.to_string(),
+    };
+    let file_dir = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+    let object_path = join_paths(&file_dir, file_name)?;
+
+    let (catalog_path, path_is_relative) = if catalog_id.is_some() {
+        // Multicatalog backends physically scope writes under `cat_<id>`.
+        // Register the full object path as absolute so readers resolve the
+        // same key rather than `data_path/schema/table/file`.
+        (object_path, false)
+    } else {
+        // Single-catalog backends preserve the historical layout and store file
+        // names relative to the table path.
+        (file_name.to_string(), true)
+    };
+
+    Ok(TableFileLocation {
+        file_dir,
+        catalog_path,
+        path_is_relative,
+    })
+}
+
 impl DuckLakeTableWriter {
     pub fn new(
         metadata: Arc<dyn MetadataWriter>,
@@ -103,20 +142,22 @@ impl DuckLakeTableWriter {
         // skip the segment, preserving the historical `{schema}/{table}/…`
         // layout. `cat_` prefix + numeric id is rename-safe and needs no
         // sanitisation.
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
+        let location = table_file_location(
+            self.metadata.catalog_id(),
+            &self.base_key_path,
+            schema_name,
+            table_name,
+            &file_name,
+        )?;
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
-            file_name.clone(),
+            location.file_dir,
             file_name,
-            true,
+            location.catalog_path,
+            location.path_is_relative,
             mode,
         )
     }
@@ -280,13 +321,15 @@ impl DuckLakeTableWriter {
     ) -> Result<DeleteFileInfo> {
         use arrow::array::{Int64Array, StringArray};
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
-        let object_path_str = join_paths(&table_key, &file_name)?;
+        let location = table_file_location(
+            self.metadata.catalog_id(),
+            &self.base_key_path,
+            schema_name,
+            table_name,
+            &file_name,
+        )?;
+        let object_path_str = join_paths(&location.file_dir, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys).
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
@@ -324,12 +367,16 @@ impl DuckLakeTableWriter {
             return Err(e.into());
         }
 
-        // Registered relative to the table path (like data files); the reader
-        // resolves it against the same table data dir.
-        Ok(
-            DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
-                .with_footer_size(footer_size),
-        )
+        // Single-catalog backends register relative to the table path. For
+        // multicatalog, register the full scoped path as absolute so readers
+        // resolve the same key the writer uploaded.
+        let mut info =
+            DeleteFileInfo::new(location.catalog_path, file_size, positions.len() as i64)
+                .with_footer_size(footer_size);
+        if !location.path_is_relative {
+            info = info.with_absolute_path();
+        }
+        Ok(info)
     }
 }
 
@@ -580,6 +627,27 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multicatalog_file_location_registers_scoped_absolute_path() {
+        let location = table_file_location(Some(7), "/ducklake", "main", "roads", "a.parquet")
+            .expect("location");
+        assert_eq!(location.file_dir, "/ducklake/cat_7/main/roads");
+        assert_eq!(
+            location.catalog_path,
+            "/ducklake/cat_7/main/roads/a.parquet"
+        );
+        assert!(!location.path_is_relative);
+    }
+
+    #[test]
+    fn single_catalog_file_location_preserves_relative_filename() {
+        let location =
+            table_file_location(None, "/ducklake", "main", "roads", "a.parquet").expect("location");
+        assert_eq!(location.file_dir, "/ducklake/main/roads");
+        assert_eq!(location.catalog_path, "a.parquet");
+        assert!(location.path_is_relative);
+    }
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::DataType;
 
