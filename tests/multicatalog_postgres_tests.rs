@@ -3599,15 +3599,15 @@ async fn writes_segregate_data_files_by_catalog_directory() {
             .unwrap();
     }
 
-    // Pull every (catalog_id, schema.path, table.path, file.path) tuple. The
-    // multicatalog reader walks exactly these columns plus data_path; if our
-    // writer's upload prefix doesn't match this chain, the file isn't where
-    // the reader will look.
+    // Pull every (catalog_id, schema.path, table.path, file.path) tuple. Fresh
+    // schemas carry the scope too, but multicatalog file metadata is absolute
+    // so its correctness does not depend on that separate metadata invariant.
     let rows = sqlx::query(
         "SELECT m.catalog_id,
                 s.schema_name, s.path AS schema_path,
                 t.table_name,  t.path AS table_path,
-                d.path         AS file_path
+                d.path         AS file_path,
+                d.path_is_relative AS file_path_is_relative
          FROM ducklake_data_file d
          JOIN ducklake_table t              ON t.table_id  = d.table_id
          JOIN ducklake_schema s             ON s.schema_id = t.schema_id
@@ -3626,6 +3626,7 @@ async fn writes_segregate_data_files_by_catalog_directory() {
         let table_name: String = row.try_get("table_name").unwrap();
         let table_path: String = row.try_get("table_path").unwrap();
         let file_path: String = row.try_get("file_path").unwrap();
+        let file_path_is_relative: bool = row.try_get("file_path_is_relative").unwrap();
 
         // schema_name is what the user asked for; schema.path is where files
         // physically land. The id-prefixed path is what gives each catalog
@@ -3637,20 +3638,21 @@ async fn writes_segregate_data_files_by_catalog_directory() {
             "catalog {cid} schema.path must carry the cat_<id> prefix",
         );
         assert_eq!(table_path, table_name); // unchanged
+        assert!(!file_path_is_relative);
+        assert!(file_path.ends_with(".parquet"));
+        let scoped_table_path = root
+            .path()
+            .join(format!("cat_{cid}"))
+            .join(&schema_name)
+            .join(&table_name);
         assert!(
-            file_path.ends_with(".parquet") && !file_path.contains('/'),
-            "data_file.path should still be just the bare filename, got {file_path:?}",
+            std::path::Path::new(&file_path).starts_with(&scoped_table_path),
+            "absolute file metadata should carry the catalog scope: {file_path:?}",
         );
 
-        // End-to-end: rebuild the reader's resolution chain manually and
-        // assert it points at a real file. This is the assertion that would
-        // have caught the bug where the writer's upload prefix didn't match
-        // schema.path.
-        let resolved = root
-            .path()
-            .join(&schema_path)
-            .join(&table_path)
-            .join(&file_path);
+        // An absolute file path short-circuits the schema/table path chain.
+        // Assert that it names the object actually uploaded by the writer.
+        let resolved = std::path::Path::new(&file_path);
         assert!(
             resolved.is_file(),
             "resolved path missing on disk: {resolved:?}",
@@ -3662,6 +3664,122 @@ async fn writes_segregate_data_files_by_catalog_directory() {
         top_segments.len(),
         2,
         "two catalogs must land under distinct cat_<id> top segments: {top_segments:?}",
+    );
+}
+
+/// Compatibility regression for a table created before catalog-scoped schema
+/// paths were introduced. Its existing relative file lives under `public/t`.
+/// A later append uploads under `cat_<id>/public/t`, so registering that new file
+/// as another relative filename makes the reader look in the legacy directory.
+/// Absolute metadata for the append must allow both layouts to remain readable;
+/// changing the schema path instead would break the existing file.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn write_reads_through_pre_scoping_schema_path() {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, MulticatalogProvider};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let catalog_id = mgr.create_catalog("legacy_path").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+
+    let root = TempDir::new().unwrap();
+    writer.set_data_path(root.path().to_str().unwrap()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+
+    // Create a valid table, then transform its one file into the exact legacy
+    // layout. This retains the real columns/field ids and only changes paths.
+    let old_batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+    table_writer
+        .write_table("public", "t", &[old_batch])
+        .await
+        .unwrap();
+    let (old_file_id, old_absolute_path): (i64, String) = sqlx::query_as(
+        "SELECT data_file_id, path FROM ducklake_data_file ORDER BY data_file_id LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let old_file_name = std::path::Path::new(&old_absolute_path)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let legacy_dir = root.path().join("public/t");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    let old_scoped_path = root
+        .path()
+        .join(format!("cat_{catalog_id}/public/t"))
+        .join(&old_file_name);
+    std::fs::rename(old_scoped_path, legacy_dir.join(&old_file_name)).unwrap();
+    sqlx::query("UPDATE ducklake_schema SET path = 'public' WHERE schema_name = 'public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ducklake_data_file SET path = $1, path_is_relative = TRUE WHERE data_file_id = $2",
+    )
+    .bind(&old_file_name)
+    .bind(old_file_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let new_batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2]))]).unwrap();
+    table_writer
+        .append_table("public", "t", &[new_batch])
+        .await
+        .unwrap();
+
+    let files: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT path, path_is_relative FROM ducklake_data_file ORDER BY data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let provider = MulticatalogProvider::with_pool(pool, "legacy_path")
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("legacy_path", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id FROM legacy_path.public.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.values(), &[1, 2]);
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0], (old_file_name, true));
+    assert!(!files[1].1);
+    assert!(
+        std::path::Path::new(&files[1].0)
+            .starts_with(root.path().join(format!("cat_{catalog_id}/public/t")))
     );
 }
 

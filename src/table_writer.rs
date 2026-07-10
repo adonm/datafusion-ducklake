@@ -67,8 +67,10 @@ fn table_file_location(
 
     let (catalog_path, path_is_relative) = if catalog_id.is_some() {
         // Multicatalog backends physically scope writes under `cat_<id>`.
-        // Register the full object path as absolute so readers resolve the
-        // same key rather than `data_path/schema/table/file`.
+        // Fresh schemas also encode that scope in `schema.path`, so a relative
+        // filename works there. Register the full object path independently so
+        // writes remain readable through pre-scoping or explicitly-created
+        // schemas whose stored path is still just `<schema>`.
         (object_path, false)
     } else {
         // Single-catalog backends preserve the historical layout and store file
@@ -368,8 +370,8 @@ impl DuckLakeTableWriter {
         }
 
         // Single-catalog backends register relative to the table path. For
-        // multicatalog, register the full scoped path as absolute so readers
-        // resolve the same key the writer uploaded.
+        // multicatalog, keep the catalog scope in the file metadata itself so
+        // this also works with pre-scoping or explicitly-created schema paths.
         let mut info =
             DeleteFileInfo::new(location.catalog_path, file_size, positions.len() as i64)
                 .with_footer_size(footer_size);
@@ -629,7 +631,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multicatalog_file_location_registers_scoped_absolute_path() {
+    fn multicatalog_file_location_is_independent_of_stored_schema_path() {
         let location = table_file_location(Some(7), "/ducklake", "main", "roads", "a.parquet")
             .expect("location");
         assert_eq!(location.file_dir, "/ducklake/cat_7/main/roads");
