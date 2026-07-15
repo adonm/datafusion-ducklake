@@ -1,10 +1,10 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics,
-    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider,
-    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
+    MetadataProvider, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
     SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS,
     SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
@@ -13,6 +13,7 @@ use crate::metadata_provider::{
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
@@ -241,6 +242,228 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(files)
     }
 
+    fn get_table_summary_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<DuckLakeStatistics> {
+        let conn = self.connection();
+        let table = match conn.prepare(SQL_GET_TABLE_STATS) {
+            Ok(mut stmt) => {
+                let mut rows = stmt.query([table_id])?;
+                rows.next()?
+                    .map(|row| {
+                        Ok::<_, duckdb::Error>(DuckLakeTableStatistics {
+                            record_count: row.get(0)?,
+                            file_size_bytes: row.get(1)?,
+                        })
+                    })
+                    .transpose()?
+            },
+            Err(error) if is_missing_statistics_table(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let column_sizes: HashMap<i64, i64> = match conn.prepare(
+            "SELECT stats.column_id,
+                    CASE
+                      WHEN COUNT(*) = COUNT(stats.column_size_bytes)
+                       AND COUNT(*) = (
+                         SELECT COUNT(*) FROM ducklake_data_file visible
+                         WHERE visible.table_id = ?
+                           AND ? >= visible.begin_snapshot
+                           AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
+                       )
+                      THEN CAST(SUM(stats.column_size_bytes) AS BIGINT)
+                    END
+             FROM ducklake_file_column_stats stats
+             INNER JOIN ducklake_data_file data
+               ON data.data_file_id = stats.data_file_id
+              AND data.table_id = stats.table_id
+             WHERE stats.table_id = ?
+               AND ? >= data.begin_snapshot
+               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+             GROUP BY stats.column_id",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(
+                    params![table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )?
+                .filter_map(|row| match row {
+                    Ok((column_id, Some(size))) => Some(Ok((column_id, size))),
+                    Ok((_, None)) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<_, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let bounds_are_exact: bool = conn.query_row(
+            "SELECT NOT EXISTS (
+                 SELECT 1 FROM ducklake_delete_file
+                 WHERE table_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)
+             )",
+            params![table_id, snapshot_id, snapshot_id],
+            |row| row.get(0),
+        )?;
+        let columns = match conn.prepare(SQL_GET_TABLE_COLUMN_STATS) {
+            Ok(mut stmt) => stmt
+                .query_map([table_id], |row| {
+                    let column_id = row.get(0)?;
+                    Ok(DuckLakeTableColumnStatistics {
+                        column_id,
+                        contains_null: row.get(1)?,
+                        min_value: row.get(2)?,
+                        max_value: row.get(3)?,
+                        column_size_bytes: column_sizes.get(&column_id).copied(),
+                        bounds_are_exact,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(DuckLakeStatistics {
+            table,
+            columns,
+            files: Vec::new(),
+        })
+    }
+
+    fn get_table_file_metadata_page(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+    ) -> crate::Result<Vec<DuckLakeFileMetadata>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
+        })?;
+        let conn = self.connection();
+        let sql = format!(
+            "{SQL_GET_DATA_FILES}
+             AND data.data_file_id > ?
+             ORDER BY data.data_file_id
+             LIMIT ?"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let files = statement
+            .query_map(
+                params![
+                    table_id,
+                    snapshot_id,
+                    snapshot_id,
+                    table_id,
+                    snapshot_id,
+                    snapshot_id,
+                    after_data_file_id.unwrap_or(i64::MIN),
+                    limit
+                ],
+                |row| {
+                    let delete_file_id: Option<i64> = row.get(8)?;
+                    let (delete_file, delete_count) = if delete_file_id.is_some() {
+                        (
+                            Some(DuckLakeFileData {
+                                path: row.get(9)?,
+                                path_is_relative: row.get(10)?,
+                                file_size_bytes: row.get(11)?,
+                                footer_size: row.get(12)?,
+                                encryption_key: row.get(13)?,
+                            }),
+                            row.get(14)?,
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    Ok(DuckLakeTableFile {
+                        data_file_id: row.get(0)?,
+                        file: DuckLakeFileData {
+                            path: row.get(1)?,
+                            path_is_relative: row.get(2)?,
+                            file_size_bytes: row.get(3)?,
+                            footer_size: row.get(4)?,
+                            encryption_key: row.get(5)?,
+                        },
+                        delete_file_id,
+                        delete_file,
+                        row_id_start: row.get(6)?,
+                        snapshot_id: Some(snapshot_id),
+                        begin_snapshot: None,
+                        schema_version: None,
+                        partial_max: None,
+                        max_row_count: row.get(7)?,
+                        delete_count,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
+            return Ok(Vec::new());
+        };
+        let statistics = match conn.prepare(
+            "SELECT stats.data_file_id, stats.column_id,
+                    stats.column_size_bytes, stats.value_count, stats.null_count,
+                    stats.min_value, stats.max_value
+             FROM ducklake_file_column_stats AS stats
+             INNER JOIN ducklake_data_file AS data
+               ON data.data_file_id = stats.data_file_id
+              AND data.table_id = stats.table_id
+             WHERE stats.table_id = ?
+               AND ? >= data.begin_snapshot
+               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+               AND stats.data_file_id > ?
+               AND stats.data_file_id <= ?
+             ORDER BY stats.data_file_id, stats.column_id",
+        ) {
+            Ok(mut statement) => statement
+                .query_map(
+                    params![
+                        table_id,
+                        snapshot_id,
+                        snapshot_id,
+                        after_data_file_id.unwrap_or(i64::MIN),
+                        last_data_file_id
+                    ],
+                    |row| {
+                        Ok(DuckLakeFileColumnStatistics {
+                            data_file_id: row.get(0)?,
+                            column_id: row.get(1)?,
+                            column_size_bytes: row.get(2)?,
+                            value_count: row.get(3)?,
+                            null_count: row.get(4)?,
+                            min_value: row.get(5)?,
+                            max_value: row.get(6)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
+        for statistic in statistics {
+            statistics_by_file
+                .entry(statistic.data_file_id)
+                .or_default()
+                .push(statistic);
+        }
+        Ok(files
+            .into_iter()
+            .map(|file| DuckLakeFileMetadata {
+                column_statistics: statistics_by_file
+                    .remove(&file.data_file_id)
+                    .unwrap_or_default(),
+                file,
+            })
+            .collect())
+    }
+
     fn get_table_statistics(
         &self,
         table_id: i64,
@@ -272,6 +495,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         contains_null: row.get(1)?,
                         min_value: row.get(2)?,
                         max_value: row.get(3)?,
+                        column_size_bytes: None,
+                        bounds_are_exact: false,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
