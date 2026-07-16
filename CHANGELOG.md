@@ -7,42 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- CDC feeds missed changes inside compaction-merged files. Windows starting past a
-  merged file's `begin_snapshot` now include it via `partial_max`, each merged row
-  is attributed to its origin snapshot (from the embedded
-  `_ducklake_internal_snapshot_id` column), out-of-window rows are filtered, and a
-  merge itself emits no change events — matching official DuckLake. Catalogs
-  written under the older spec (`partial_file_info`) are handled on the DuckDB
-  backend (#179).
-
 ### Changed
-- **BREAKING**: `ducklake_table_changes` / `ducklake_table_deletions` snapshot bounds
-  are now inclusive on both ends, matching official DuckLake: `(t, start, end)` returns
-  changes committed in snapshots `start..=end`. Previously the start bound was exclusive.
-  Migration: callers paging with `(last, now]` cursors should pass `last + 1` as the new
-  start (#179).
-- **BREAKING**: the CDC feeds' column order now matches official DuckLake — the
-  metadata columns `(snapshot_id, rowid, change_type)` lead, followed by the table
-  columns. Previously they trailed. Queries selecting columns by name are unaffected;
-  `SELECT *` consumers and positional readers must adjust (#179).
-- **BREAKING**: `ducklake_table_changes` now emits pure deletes as
-  `change_type='delete'` rows carrying the deleted rows' old values, matching official
-  DuckLake. Previously they were omitted (available only via `ducklake_table_deletions`,
-  which is unchanged). Consumers reading both feeds should de-duplicate deletions or
-  switch to a single feed (#179).
+- **BREAKING**: CDC snapshot bounds are inclusive on both ends, matching official
+  DuckLake (was exclusive-start); cursor pagination should pass `last + 1` (#179).
+- **BREAKING**: CDC columns `(snapshot_id, rowid, change_type)` now lead the output,
+  matching official DuckLake (they trailed before) (#179).
+- **BREAKING**: `ducklake_table_changes` emits pure deletes as `change_type='delete'`
+  rows with the old values, matching official DuckLake (#179).
 
 ### Added
-- Differential CDC conformance suite: runs official DuckDB `ducklake_table_changes` /
-  `ducklake_table_deletions` and this crate's feeds on identical catalogs and diffs
-  the results, with explicit normalizers for the documented surface differences (#179).
+- Differential CDC conformance suite: diffs both feeds live against the official
+  extension on identical catalogs (#179).
+- `ducklake_table_insertions()` — the official insertions feed (#179).
+- CDC snapshot bounds accept timestamp strings (official `AT (TIMESTAMP => ...)`
+  semantics) (#179).
+- The vendored sqllogictest suite binds (CDC UDTFs + dialect translation) and fails
+  the build on expected-pass regressions (#179).
 
 ### Fixed
-- DuckDB backend: `ducklake_table_deletions` used a different start bound than the
-  insert feed, so deletions committed exactly at a window's start snapshot were
-  reported inconsistently between the two feeds. All backends and both feeds now
-  share a single window contract — the inclusive-on-both-ends semantics described
-  under **Changed** (#179).
+- DuckDB backend: delete-file window off-by-one double-reported boundary deletions (#179).
+- CDC missed changes inside compaction-merged files: `partial_max` windows + per-row
+  origin snapshots (#179).
+- Cumulative (3-column) delete files are windowed per row, each deletion at its own
+  delete snapshot (#179).
+- `SELECT COUNT(*)` over `ducklake_table_changes` errored on the insert-only path (#179).
 
 ## [0.5.0] - 2026-07-15
 
