@@ -5,9 +5,11 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
-    reconstruct_list_columns, reconstruct_list_columns_with_table,
+    MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
+    reconstruct_list_columns_with_table,
 };
+use crate::partition::PartitionSpec;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -60,6 +62,8 @@ fn decode_table_file(row: &SqliteRow, snapshot_id: i64) -> Result<DuckLakeTableF
         partial_max: row.try_get(16)?,
         max_row_count: row.try_get(7)?,
         delete_count,
+        partition_id: None,
+        partition_values: Vec::new(),
     })
 }
 
@@ -409,6 +413,49 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
+        block_on(async {
+            // Pruning is only safe with exactly one spec generation ever (see
+            // PartitionSpec::prune_safe); the live spec is returned regardless so
+            // the write path always targets the current generation.
+            let generation_count: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&self.pool)
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let prune_safe = generation_count == 1;
+            let rows = match sqlx::query(SQL_GET_PARTITION_SPEC)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<i64, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PartitionSpec::from_rows(parsed, prune_safe))
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,
@@ -434,8 +481,18 @@ impl MetadataProvider for SqliteMetadataProvider {
             )
             .fetch_one(&self.pool)
             .await?;
+            let has_partition_id: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partition_id'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
             let partial_max_expr = if has_partial_max > 0 {
                 "data.partial_max"
+            } else {
+                "NULL"
+            };
+            let partition_id_expr = if has_partition_id > 0 {
+                "data.partition_id"
             } else {
                 "NULL"
             };
@@ -457,7 +514,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     del.delete_file_id, del.path, del.path_is_relative,
                     del.file_size_bytes, del.footer_size, del.encryption_key,
                     del.delete_count, data.begin_snapshot,
-                    {partial_max_expr}, {schema_version_expr}
+                    {partial_max_expr}, {schema_version_expr}, {partition_id_expr}
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -484,7 +541,13 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .await?;
             let files = rows
                 .iter()
-                .map(|row| decode_table_file(row, snapshot_id))
+                .map(|row| {
+                    let mut file = decode_table_file(row, snapshot_id)?;
+                    // partition_id projected as the trailing column (index 18); NULL
+                    // (→ None) on unpartitioned files or pre-migration catalogs.
+                    file.partition_id = row.try_get(18)?;
+                    Ok(file)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
                 return Ok(Vec::new());
@@ -537,13 +600,44 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .or_default()
                     .push(statistic);
             }
+
+            // Enrich with per-file partition values (for pruning), scoped to the
+            // page's data_file_id range. Missing partition table => no enrichment.
+            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+            match sqlx::query(SQL_GET_FILE_PARTITION_VALUES)
+                .bind(table_id)
+                .bind(after_data_file_id.unwrap_or(i64::MIN))
+                .bind(last_data_file_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        let data_file_id: i64 = row.try_get(0)?;
+                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let value: Option<String> = row.try_get(2)?;
+                        values_by_file
+                            .entry(data_file_id)
+                            .or_default()
+                            .push((key_index, value));
+                    }
+                },
+                Err(error) if is_missing_statistics_table(&error) => {},
+                Err(error) => return Err(error.into()),
+            }
+
             Ok(files
                 .into_iter()
-                .map(|file| DuckLakeFileMetadata {
-                    column_statistics: statistics_by_file
-                        .remove(&file.data_file_id)
-                        .unwrap_or_default(),
-                    file,
+                .map(|mut file| {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                    DuckLakeFileMetadata {
+                        column_statistics: statistics_by_file
+                            .remove(&file.data_file_id)
+                            .unwrap_or_default(),
+                        file,
+                    }
                 })
                 .collect())
         })
@@ -1096,6 +1190,8 @@ impl MetadataProvider for SqliteMetadataProvider {
                             partial_max: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
+                            partition_id: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 })
