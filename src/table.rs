@@ -11,6 +11,7 @@ use crate::metadata_provider::{
     DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile,
     FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
+use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
@@ -226,6 +227,23 @@ fn parse_statistic_scalar(
     parsed
 }
 
+/// Whether a stored float `max_value` is a usable upper bound.
+///
+/// Catalog min/max exclude NaN, and NaN sorts above every value in both DuckDB
+/// and DataFusion (IEEE 754 totalOrder) — so a float column whose NaN state is
+/// unknown (`None`, e.g. register-by-reference loads) or positive (`Some(true)`,
+/// e.g. stats written by official DuckLake's INSERT) may hold values above its
+/// recorded max, and pruning `x > C` on that max would wrongly drop rows. The
+/// recorded min needs no such gate: NaN can never sit below it, so `min <= v`
+/// holds for every value including NaN. Mirrors official DuckLake, which ORs
+/// `contains_nan` into its greater-than filter SQL.
+fn float_max_is_bound(data_type: &DataType, contains_nan: Option<bool>) -> bool {
+    !matches!(
+        data_type,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) || contains_nan == Some(false)
+}
+
 fn scalar_precision(
     value: Option<&str>,
     column: &DuckLakeTableColumn,
@@ -319,8 +337,11 @@ fn build_datafusion_statistics(
                 .unwrap_or(Precision::Absent);
             column_statistics.min_value =
                 scalar_precision(raw.min_value.as_deref(), column, field_type, exact);
-            column_statistics.max_value =
-                scalar_precision(raw.max_value.as_deref(), column, field_type, exact);
+            column_statistics.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+                scalar_precision(raw.max_value.as_deref(), column, field_type, exact)
+            } else {
+                Precision::Absent
+            };
             column_statistics.byte_size = raw
                 .column_size_bytes
                 .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
@@ -390,12 +411,16 @@ fn build_datafusion_statistics(
                 field_type,
                 raw.bounds_are_exact,
             );
-            output.max_value = scalar_precision(
-                raw.max_value.as_deref(),
-                column,
-                field_type,
-                raw.bounds_are_exact,
-            );
+            output.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+                scalar_precision(
+                    raw.max_value.as_deref(),
+                    column,
+                    field_type,
+                    raw.bounds_are_exact,
+                )
+            } else {
+                Precision::Absent
+            };
             output.byte_size = raw
                 .column_size_bytes
                 .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
@@ -473,11 +498,14 @@ fn build_datafusion_statistics(
                 None if all_null => {},
                 None => min_complete = false,
             }
-            match raw
+            // An unusable float max (NaN state unknown/positive) is treated as
+            // absent: with `all_null` it contributes nothing, otherwise it
+            // poisons `max_complete` so the aggregate max degrades to unknown.
+            let usable_max = raw
                 .max_value
                 .as_deref()
-                .and_then(|value| parse_statistic_scalar(value, column, field_type))
-            {
+                .filter(|_| float_max_is_bound(field_type, raw.contains_nan));
+            match usable_max.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     max_value = match max_value {
                         Some(current) => current.partial_cmp(&value).map(|ordering| {
@@ -1113,8 +1141,10 @@ impl DuckLakeTable {
     /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
     /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
-    /// is a possible optimization. Only valid for insert-only files, where
-    /// `position = rowid - row_id_start`.
+    /// is a possible optimization — but any such pushdown must exclude float
+    /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
+    /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
+    /// Only valid for insert-only files, where `position = rowid - row_id_start`.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -1334,6 +1364,11 @@ impl DuckLakeTable {
             None => self.schema.clone(),
         };
 
+        // Float columns whose NaN state isn't known false for every scanned
+        // file: predicates on them must not reach the parquet reader's
+        // row-group/page pruning (footer bounds exclude NaN).
+        let nan_unsafe_columns = self.nan_unsafe_float_columns(files, file_statistics);
+
         // Build one scan per physical-schema group; ColumnRenameExec coerces each
         // group to the catalog schema (renamed columns or a differing Arrow type).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
@@ -1352,7 +1387,7 @@ impl DuckLakeTable {
             let parquet_exec: Arc<dyn ExecutionPlan> =
                 DataSourceExec::from_data_source(builder.build());
 
-            let exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
+            let mut exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
                 Arc::new(ColumnRenameExec::new(
                     parquet_exec,
                     output_schema.clone(),
@@ -1361,10 +1396,53 @@ impl DuckLakeTable {
             } else {
                 parquet_exec
             };
+            if !nan_unsafe_columns.is_empty() {
+                exec = Arc::new(NanPruningBarrierExec::new(
+                    exec,
+                    Arc::clone(&nan_unsafe_columns),
+                ));
+            }
             execs.push(exec);
         }
 
         combine_execution_plans(execs)
+    }
+
+    /// Float columns whose stored max is unusable for at least one of `files`
+    /// — the NaN state is unknown or positive, so parquet footer bounds (which
+    /// exclude NaN) must not drive row-group/page pruning for predicates on
+    /// them. Detected via the already-gated per-file statistics: a float
+    /// column with an `Absent` max is exactly one whose `contains_nan` isn't
+    /// known false (see `float_max_is_bound`); a file with no statistics entry
+    /// is unknown across the board.
+    fn nan_unsafe_float_columns(
+        &self,
+        files: &[&DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> Arc<HashSet<String>> {
+        let mut unsafe_columns = HashSet::new();
+        for (index, field) in self.physical_schema.fields().iter().enumerate() {
+            if !matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                continue;
+            }
+            let any_unsafe = files.iter().any(|file| {
+                file_statistics
+                    .get(&file.data_file_id)
+                    .is_none_or(|statistics| {
+                        matches!(
+                            statistics.column_statistics[index].max_value,
+                            Precision::Absent
+                        )
+                    })
+            });
+            if any_unsafe {
+                unsafe_columns.insert(field.name().clone());
+            }
+        }
+        Arc::new(unsafe_columns)
     }
 
     /// Configure this table for write operations.
@@ -1824,15 +1902,27 @@ impl DuckLakeTable {
         // FixedSizeList vs the catalog's List). Coerces each column to
         // `output_schema`.
         let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
-        if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
-            Ok(Arc::new(ColumnRenameExec::new(
-                after_deletes,
-                output_schema,
-                file_cfg.name_mapping.clone(),
-            )))
-        } else {
-            Ok(after_deletes)
+        let mut exec =
+            if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
+                Arc::new(ColumnRenameExec::new(
+                    after_deletes,
+                    output_schema,
+                    file_cfg.name_mapping.clone(),
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                after_deletes
+            };
+        // The positional path already refuses all filter pushdown
+        // (PositionalFileSource); only the legacy plain scan lets predicates
+        // reach the parquet reader's pruning, so only it needs the NaN barrier.
+        if !needs_position {
+            let nan_unsafe_columns =
+                self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
+            if !nan_unsafe_columns.is_empty() {
+                exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
+            }
         }
+        Ok(exec)
     }
 
     /// Output schema for the rowid-projected per-file plan: physical fields
@@ -2960,6 +3050,7 @@ mod tests {
                     contains_null: Some(false),
                     min_value: Some("1".to_string()),
                     max_value: Some("1000000".to_string()),
+                    contains_nan: None,
                     column_size_bytes: Some(1_000_000),
                     bounds_are_exact: true,
                 }],
@@ -3006,6 +3097,7 @@ mod tests {
                         null_count: Some(0),
                         min_value: Some(data_file_id.to_string()),
                         max_value: Some(data_file_id.to_string()),
+                        contains_nan: None,
                     }],
                 })
                 .collect();
@@ -3153,6 +3245,7 @@ mod tests {
                     contains_null: Some(false),
                     min_value: Some("0".to_string()),
                     max_value: Some("9".to_string()),
+                    contains_nan: None,
                     column_size_bytes: Some(40),
                     bounds_are_exact: false,
                 }],
@@ -3172,6 +3265,178 @@ mod tests {
             Precision::Inexact(ScalarValue::Int32(Some(9)))
         );
         assert_eq!(column.byte_size, Precision::Inexact(40));
+        Ok(())
+    }
+
+    #[test]
+    fn float_file_max_gated_by_contains_nan() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+        let mut file =
+            DuckLakeTableFile::new(DuckLakeFileData::new("f.parquet".to_string(), true, 1));
+        file.data_file_id = 7;
+
+        for (contains_nan, max_usable) in [(None, false), (Some(true), false), (Some(false), true)]
+        {
+            let (table_stats, file_stats) = build_datafusion_statistics(
+                &schema,
+                &columns,
+                std::slice::from_ref(&file),
+                DuckLakeStatistics {
+                    files: vec![DuckLakeFileColumnStatistics {
+                        data_file_id: 7,
+                        column_id: 1,
+                        column_size_bytes: Some(16),
+                        value_count: Some(2),
+                        null_count: Some(0),
+                        min_value: Some("1.0".to_string()),
+                        max_value: Some("2.0".to_string()),
+                        contains_nan,
+                    }],
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
+
+            // min is a valid lower bound regardless of NaN state — NaN sorts
+            // above every value, so it can never undercut the recorded min.
+            let per_file = &file_stats[&7].column_statistics[0];
+            let table_col = &table_stats.column_statistics[0];
+            assert_eq!(
+                per_file.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+            assert_eq!(
+                table_col.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+
+            let expected_max = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(2.0)))
+            } else {
+                Precision::Absent
+            };
+            assert_eq!(
+                per_file.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+            assert_eq!(
+                table_col.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn float_rollup_max_gated_by_contains_nan() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+
+        for (contains_nan, max_usable) in [(None, false), (Some(true), false), (Some(false), true)]
+        {
+            let (statistics, _) = build_datafusion_statistics(
+                &schema,
+                &columns,
+                &[],
+                DuckLakeStatistics {
+                    columns: vec![DuckLakeTableColumnStatistics {
+                        column_id: 1,
+                        contains_null: Some(false),
+                        min_value: Some("1.0".to_string()),
+                        max_value: Some("2.0".to_string()),
+                        contains_nan,
+                        column_size_bytes: Some(16),
+                        bounds_are_exact: true,
+                    }],
+                    ..Default::default()
+                },
+                true,
+                false,
+            );
+
+            let column = &statistics.column_statistics[0];
+            assert_eq!(
+                column.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+            let expected_max = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(2.0)))
+            } else {
+                Precision::Absent
+            };
+            assert_eq!(
+                column.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn float_table_aggregate_max_needs_all_files_nan_free() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+        let mut file_a =
+            DuckLakeTableFile::new(DuckLakeFileData::new("a.parquet".to_string(), true, 1));
+        file_a.data_file_id = 1;
+        let mut file_b =
+            DuckLakeTableFile::new(DuckLakeFileData::new("b.parquet".to_string(), true, 1));
+        file_b.data_file_id = 2;
+        let table_files = vec![file_a, file_b];
+
+        let stat =
+            |data_file_id, min: &str, max: &str, contains_nan| DuckLakeFileColumnStatistics {
+                data_file_id,
+                column_id: 1,
+                column_size_bytes: Some(16),
+                value_count: Some(2),
+                null_count: Some(0),
+                min_value: Some(min.to_string()),
+                max_value: Some(max.to_string()),
+                contains_nan,
+            };
+        let build = |nan_b| {
+            build_datafusion_statistics(
+                &schema,
+                &columns,
+                &table_files,
+                DuckLakeStatistics {
+                    files: vec![stat(1, "1.0", "2.0", Some(false)), stat(2, "0.5", "3.0", nan_b)],
+                    ..Default::default()
+                },
+                false,
+                true,
+            )
+            .0
+        };
+
+        // Both files known NaN-free: bounds fold across the files.
+        let statistics = build(Some(false));
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Float64(Some(0.5)))
+        );
+        assert_eq!(
+            statistics.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Float64(Some(3.0)))
+        );
+
+        // One file NaN-unknown: its max is untrusted, so the aggregate max
+        // degrades to unknown; the min still folds from both files.
+        let statistics = build(None);
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Float64(Some(0.5)))
+        );
+        assert_eq!(statistics.column_statistics[0].max_value, Precision::Absent);
         Ok(())
     }
 
