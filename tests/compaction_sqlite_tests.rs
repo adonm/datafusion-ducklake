@@ -213,6 +213,227 @@ async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
     .await
 }
 
+/// Compaction of a PARTITIONED table must merge only within a partition and carry
+/// each output's partition assignment over from its sources — official DuckLake
+/// groups merge candidates by (schema_version, partition_id, partition_values).
+/// Merging across partitions would produce a file belonging to no single partition:
+/// unprunable, and unrepresentable in `ducklake_file_partition_value`.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_only_within_a_partition_and_preserves_assignment() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, MetadataWriter, WriteMode};
+
+    let temp = TempDir::new().unwrap();
+    // Create `main.t(id, val)` and partition it by `val` before writing any data.
+    let writer = Arc::new(make_writer(&temp).await);
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let table_id = {
+        let s = writer
+            .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                s.table_id,
+                "main",
+                "t",
+                s.snapshot_id,
+                WriteMode::Replace,
+                s.base_snapshot_id,
+                &cols,
+                &s.column_ids,
+            )
+            .unwrap();
+        writer
+            .set_partition_spec(
+                s.table_id,
+                &[("val".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        s.table_id
+    };
+
+    // Four small appends: two rows in partition val=1, two in val=2. Each append is
+    // its own snapshot, and each writes one file per partition it touches.
+    for id in [1, 2] {
+        append(&temp, vec![id, id + 10], vec![1, 2]).await;
+    }
+
+    let p = pool(&temp).await;
+    let live_before = scalar_i64(
+        &p,
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    assert_eq!(live_before, 4, "two appends x two partitions = four files");
+
+    // Merge with a target large enough to bin everything that is legal to bin.
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: 1 << 30,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+    assert!(result.did_work(), "the small files must be compacted");
+
+    // Two outputs (one per partition), never one merged across both.
+    let live_after: Vec<(Option<i64>, Option<String>)> = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = ? AND df.end_snapshot IS NULL
+         ORDER BY fpv.partition_value",
+    )
+    .bind(table_id)
+    .fetch_all(&p)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .collect();
+
+    assert_eq!(
+        live_after.len(),
+        2,
+        "one merged file per partition, not one across partitions: {live_after:?}"
+    );
+    let values: Vec<Option<String>> = live_after.iter().map(|(_, v)| v.clone()).collect();
+    assert_eq!(
+        values,
+        vec![Some("1".to_string()), Some("2".to_string())],
+        "each merged file keeps its partition value"
+    );
+    for (partition_id, _) in &live_after {
+        assert!(
+            partition_id.is_some(),
+            "a merged file of a partitioned table must keep its partition_id"
+        );
+    }
+
+    // And the rows survive intact, still prunable by the partition column.
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 1), (2, 1), (11, 2), (12, 2)]
+    );
+}
+
+/// A delete-driven rewrite of a PARTITIONED table must carry the source file's
+/// partition assignment onto the rewritten output. The output holds a subset of one
+/// file's rows, so it belongs to exactly that file's partition — official takes the
+/// partition from `source_files[0]` on this path too. Without this the rewrite would
+/// silently strip the assignment and the rows would stop being prunable.
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrite_preserves_partition_assignment() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, MetadataWriter, WriteMode};
+
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let table_id = {
+        let s = writer
+            .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                s.table_id,
+                "main",
+                "t",
+                s.snapshot_id,
+                WriteMode::Replace,
+                s.base_snapshot_id,
+                &cols,
+                &s.column_ids,
+            )
+            .unwrap();
+        writer
+            .set_partition_spec(
+                s.table_id,
+                &[("val".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        s.table_id
+    };
+
+    // One partition (val=1) holding 10 rows, so the rewrite has a single source.
+    append(&temp, (1..=10).collect(), vec![1; 10]).await;
+    let p = pool(&temp).await;
+    let live_spec_id = scalar_i64(
+        &p,
+        "SELECT partition_id FROM ducklake_partition_info WHERE end_snapshot IS NULL",
+    )
+    .await;
+
+    // Delete 8 of 10 rows, then rewrite past the 0.5 threshold.
+    {
+        let w = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+        let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+        let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(w)).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("ducklake", Arc::new(catalog));
+        ctx.sql("DELETE FROM ducklake.main.t WHERE id <= 8")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+    let result = run_rewrite(
+        &temp,
+        RewriteOptions {
+            delete_threshold: 0.5,
+        },
+    )
+    .await;
+    assert_eq!(result.files_created, 1, "the live rows are rewritten");
+
+    // The rewritten file keeps the partition it came from.
+    let (partition_id, value): (Option<i64>, Option<String>) = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = ? AND df.end_snapshot IS NULL
+           AND df.begin_snapshot = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)",
+    )
+    .bind(table_id)
+    .fetch_one(&p)
+    .await
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        partition_id,
+        Some(live_spec_id),
+        "the rewritten file must keep its partition_id"
+    );
+    assert_eq!(
+        value,
+        Some("1".to_string()),
+        "the rewritten file must keep its partition value"
+    );
+    // And the surviving rows read back.
+    assert_eq!(read_rows(&temp).await, vec![(9, 1), (10, 1)]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn merge_harvests_output_stats_and_removes_source_stats() {
     // Compaction must record fresh per-file column stats for the merged output

@@ -4586,6 +4586,139 @@ async fn register_existing_data_file_adopts_column_ids() {
     );
 }
 
+/// Promoting a byte-copied parquet into a PARTITIONED table persists the caller's
+/// partition assignment, so the file is prunable exactly like one this crate wrote.
+/// Nothing is rewritten, so the values can only be carried, never derived.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_persists_partition_assignment() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_promote_part").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    // Create the table first (unpartitioned), then partition it by `name`.
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f1.parquet", 1024, 3),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    w.set_partition_spec(
+        out.table_id,
+        &[("name".to_string(), PartitionTransform::Identity)],
+    )
+    .unwrap();
+    let spec = w.live_partition_spec(out.table_id).unwrap().unwrap();
+
+    // Promote a single-partition file, declaring the partition it holds.
+    let promoted = DataFileInfo::new("name=us/f2.parquet", 512, 2)
+        .with_partition(spec.partition_id, vec![(0, Some("us".to_string()))]);
+    w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(),
+        &ids,
+        &promoted,
+        WriteMode::Append,
+    )
+    .unwrap();
+
+    let (file_partition_id, value): (Option<i64>, Option<String>) = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.path = 'name=us/f2.parquet'",
+    )
+    .bind(out.table_id)
+    .fetch_one(&pool)
+    .await
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        file_partition_id,
+        Some(spec.partition_id),
+        "a promoted file must carry the live partition generation"
+    );
+    assert_eq!(
+        value,
+        Some("us".to_string()),
+        "a promoted file must carry its partition value so it stays prunable"
+    );
+
+    // An unpartitioned promote into a partitioned table is refused: such a file
+    // cannot satisfy the spec, and silently accepting it would make the table's
+    // partition layout a lie. The error must name the actual fix — nothing raced
+    // here, so the fence's "concurrent SET PARTITIONED BY / retry" wording would send
+    // the caller chasing a problem that does not exist.
+    let unpartitioned = DataFileInfo::new("f3.parquet", 256, 1);
+    let err = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &unpartitioned,
+            WriteMode::Append,
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("with_partition"),
+        "the error must tell the caller to declare the file's partition, got: {msg}"
+    );
+    assert!(
+        !msg.contains("concurrent"),
+        "must not blame a concurrent DDL change that did not happen, got: {msg}"
+    );
+
+    // A 0-row promote is refused too. The shared fence exempts empty files for the
+    // sake of the empty-Replace truncate marker, but promote has no such marker, and
+    // official's AddFileToTable applies its key-count check with no row-count
+    // exception — so exempting it here would accept a file official rejects.
+    let empty = DataFileInfo::new("f5.parquet", 0, 0);
+    assert!(
+        w.register_existing_data_file("public", "orders", &cols(), &ids, &empty, WriteMode::Append)
+            .is_err(),
+        "a 0-row promote with no partition must be refused on a partitioned table"
+    );
+
+    // A value count that disagrees with the live spec is refused too.
+    let wrong_arity = DataFileInfo::new("f4.parquet", 256, 1).with_partition(
+        spec.partition_id,
+        vec![(0, Some("us".to_string())), (1, Some("2024".to_string()))],
+    );
+    assert!(
+        w.register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &wrong_arity,
+            WriteMode::Append,
+        )
+        .is_err(),
+        "two values for a one-key spec must be rejected"
+    );
+}
+
 /// `column_ids` must be 1:1 with `columns`; a mismatch is rejected before any
 /// write (otherwise `finalize_snapshot`'s zip would silently drop columns).
 #[tokio::test(flavor = "multi_thread")]

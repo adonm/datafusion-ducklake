@@ -1824,6 +1824,38 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn live_partition_spec(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+                 FROM ducklake_partition_info AS pi
+                 JOIN ducklake_partition_column AS pc
+                   ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+                 WHERE pi.table_id = $1 AND pi.end_snapshot IS NULL
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<i64, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // prune_safe = false: this spec is for laying out a write, never pruning.
+            Ok(crate::partition::PartitionSpec::from_rows(parsed, false))
+        })
+    }
+
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -1899,6 +1931,37 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+                        se.sort_direction, se.null_order
+                 FROM ducklake_sort_info AS si
+                 JOIN ducklake_sort_expression AS se
+                   ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+                 WHERE si.table_id = $1 AND si.end_snapshot IS NULL
+                 ORDER BY se.sort_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<String, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                        row.try_get::<String, _>(4)?,
+                        row.try_get::<String, _>(5)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::sort::SortSpec::from_rows(parsed))
         })
     }
 
@@ -2096,11 +2159,82 @@ impl MetadataWriter for PostgresMetadataWriter {
             .fetch_one(&mut *tx)
             .await?;
 
-            sqlx::query(
+            // Partition-spec fence + validation. A promoted file is registered
+            // as-is, so the caller is asserting it already holds rows of exactly one
+            // partition (official DuckLake's ducklake_add_data_files makes the same
+            // assumption, deriving the values from the file's Hive path). We check
+            // everything checkable without reading the data: the file agrees with the
+            // live generation, and its values fit that generation's keys.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            // Diagnose the promote-specific case before the shared fence: a caller
+            // that supplied no partition assignment for a partitioned table has not
+            // lost a race, so the fence's "concurrent SET PARTITIONED BY … retry"
+            // wording would send them chasing a problem that does not exist. Tell
+            // them what to actually do instead.
+            //
+            // Deliberately NOT exempting a 0-row file, unlike the shared fence.
+            // That exemption exists for the empty-Replace truncate marker a write
+            // session emits, which has no promote equivalent — a promoted file is one
+            // the caller actually produced. Official agrees: `AddFileToTable` compares
+            // the derived value count against the spec's key count with no row-count
+            // exception, so an empty file with no assignment is rejected there too.
+            if file.partition_id.is_none() && live_partition_id.is_some() {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "cannot promote {} into table {table_id}: the table is partitioned, so a \
+                     registered file must declare the single partition its rows belong to. \
+                     Attach it with DataFileInfo::with_partition (copy the values from the \
+                     source catalog, or derive them from the file's Hive path).",
+                    file.path
+                )));
+            }
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+            if let Some(partition_id) = live_partition_id.filter(|_| file.partition_id.is_some()) {
+                let key_rows = sqlx::query(
+                    "SELECT transform, column_id FROM ducklake_partition_column
+                     WHERE table_id = $1 AND partition_id = $2
+                     ORDER BY partition_key_index",
+                )
+                .bind(table_id)
+                .bind(partition_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut transforms = Vec::with_capacity(key_rows.len());
+                let mut key_column_types = Vec::with_capacity(key_rows.len());
+                for row in &key_rows {
+                    transforms.push(row.try_get::<String, _>(0)?);
+                    // Resolve each key's column_id to the Arrow type of the matching
+                    // promoted column, so an `identity` value can be cast-checked the
+                    // way official's MapHiveColumn does.
+                    let column_id: i64 = row.try_get(1)?;
+                    key_column_types.push(
+                        column_ids
+                            .iter()
+                            .position(|id| *id == column_id)
+                            .and_then(|index| columns.get(index))
+                            .and_then(|column| {
+                                crate::types::ducklake_to_arrow_type(column.ducklake_type()).ok()
+                            }),
+                    );
+                }
+                crate::metadata_writer::validate_promoted_partition_values(
+                    table_id,
+                    &transforms,
+                    &key_column_types,
+                    file,
+                )?;
+            }
+
+            let data_file_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -2110,8 +2244,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            // Persist the caller-supplied partition assignment. Without this a
+            // promoted file lands with no partition_id and no
+            // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
+            // with the table's spec.
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -2312,6 +2451,18 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+
+            // Partition-spec fence: the new row versions are a NEW write, so they
+            // must agree with the table's live partition generation exactly as
+            // register_data_file's do.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
 
             // Register the new data file (the inserted row versions), exactly as
             // register_data_file: seed stats, draw the row-id range, insert, and

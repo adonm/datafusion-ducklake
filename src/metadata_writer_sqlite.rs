@@ -1691,6 +1691,38 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn live_partition_spec(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+                 FROM ducklake_partition_info AS pi
+                 JOIN ducklake_partition_column AS pc
+                   ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+                 WHERE pi.table_id = ? AND pi.end_snapshot IS NULL
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<i64, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // prune_safe = false: this spec is for laying out a write, never pruning.
+            Ok(crate::partition::PartitionSpec::from_rows(parsed, false))
+        })
+    }
+
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -1720,6 +1752,37 @@ impl MetadataWriter for SqliteMetadataWriter {
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
             tx.commit().await?;
             Ok(new_snapshot)
+        })
+    }
+
+    fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+                        se.sort_direction, se.null_order
+                 FROM ducklake_sort_info AS si
+                 JOIN ducklake_sort_expression AS se
+                   ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+                 WHERE si.table_id = ? AND si.end_snapshot IS NULL
+                 ORDER BY se.sort_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<String, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                        row.try_get::<String, _>(4)?,
+                        row.try_get::<String, _>(5)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::sort::SortSpec::from_rows(parsed))
         })
     }
 
@@ -2266,6 +2329,18 @@ impl MetadataWriter for SqliteMetadataWriter {
             let snapshot_id =
                 finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                     .await?;
+
+            // Partition-spec fence: the new row versions are a NEW write, so they
+            // must agree with the table's live partition generation exactly as
+            // register_data_file's do.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
 
             // Register the new data file (inserted row versions), as in
             // register_data_file. Deletes are accounted at read time

@@ -106,6 +106,338 @@ const INSERT_SQL: &str = "INSERT INTO ducklake.main.events \
         (3, 'eu', TIMESTAMP '2023-03-10 08:00:00'), \
         (4, 'eu', TIMESTAMP '2024-11-05 18:00:00')) AS t(id, region, ts)";
 
+/// Four `events` rows spanning 4 partitions — (us,2023), (us,2024), (eu,2023),
+/// (eu,2024) — as separate batches, so a streaming session sees each partition
+/// across more than one `write_batch` call.
+fn events_batches() -> Vec<arrow::record_batch::RecordBatch> {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("ts", ts_type, true),
+    ]));
+    // 2023-01-15T10:00:00Z and 2024-06-20T12:00:00Z in micros.
+    let y2023: i64 = 1_673_776_800_000_000;
+    let y2024: i64 = 1_718_884_800_000_000;
+    let rows: [(&[i32], &[&str], &[i64]); 2] =
+        [(&[1, 2], &["us", "us"], &[y2023, y2024]), (&[3, 4], &["eu", "eu"], &[y2023, y2024])];
+    rows.iter()
+        .map(|(ids, regions, times)| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+                    Arc::new(arrow::array::StringArray::from(regions.to_vec())) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(times.to_vec())) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// The streaming session (`begin_write` + `write_batch` + `finish`) — the entry
+/// point an embedding engine uses for ingest, with no SQL and no MetadataProvider —
+/// must split rows across one file per partition and commit them in ONE snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_session_splits_rows_across_partitions() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await;
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+
+    let batches = events_batches();
+    let arrow_schema = batches[0].schema();
+    let mut session = table_writer
+        .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    for batch in &batches {
+        session.write_batch(batch).unwrap();
+    }
+    let result = session.finish().await.unwrap();
+
+    // One file per (region, year) partition, all in a single snapshot.
+    assert_eq!(result.records_written, 4);
+    assert_eq!(
+        result.files_written, 4,
+        "a streaming write must produce one file per partition"
+    );
+
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let live = provider
+        .get_partition_spec(env.table_id, snap)
+        .unwrap()
+        .unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), 4);
+    let mut seen: Vec<Vec<Option<String>>> = Vec::new();
+    for meta in &page {
+        assert_eq!(
+            meta.file.partition_id,
+            Some(live.partition_id),
+            "every streamed file must carry the live partition generation"
+        );
+        let mut values = meta.file.partition_values.clone();
+        values.sort_by_key(|(index, _)| *index);
+        seen.push(values.into_iter().map(|(_, v)| v).collect());
+        // The Hive directory mirrors the partition values.
+        assert!(
+            meta.file.file.path.contains("region="),
+            "partitioned file must live under a Hive path, got {}",
+            meta.file.file.path
+        );
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            vec![Some("eu".to_string()), Some("2023".to_string())],
+            vec![Some("eu".to_string()), Some("2024".to_string())],
+            vec![Some("us".to_string()), Some("2023".to_string())],
+            vec![Some("us".to_string()), Some("2024".to_string())],
+        ]
+    );
+
+    // The rows read back intact through the partitioned layout.
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events WHERE region = 'us'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2);
+}
+
+/// With the open-file cap at 1, a streaming write touching 4 partitions must still
+/// land every row: the sink finalizes the open file to make room and re-opens a
+/// partition later if more of its rows arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_session_respects_open_partition_cap() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await;
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .with_max_open_partitions(1);
+
+    let batches = events_batches();
+    let arrow_schema = batches[0].schema();
+    let mut session = table_writer
+        .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    for batch in &batches {
+        session.write_batch(batch).unwrap();
+    }
+    let result = session.finish().await.unwrap();
+    assert_eq!(result.records_written, 4, "eviction must not drop rows");
+
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 4, "every row must be readable after eviction");
+}
+
+/// A partitioned write must still respect `target_file_size` WITHIN each partition.
+///
+/// Rollover is evaluated at batch boundaries, so if the partition splitter collapsed
+/// each group into one batch the writer would emit a single file per partition of
+/// unbounded size — `target_file_size` silently unenforceable exactly on the tables
+/// most likely to be large. DuckLake merges but never splits, so such a file could
+/// never be broken up afterwards either.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_write_rolls_within_each_partition() {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await; // partitioned by (region, year(ts))
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("ts", ts_type, true),
+    ]));
+    // Many batches, ALL in the same (us, 2023) partition, so the only way to end up
+    // with more than one file is rollover firing inside that partition.
+    let y2023: i64 = 1_673_776_800_000_000;
+    let batches: Vec<RecordBatch> = (0..40)
+        .map(|b| {
+            let ids: Vec<i32> = (b * 100..(b + 1) * 100).collect();
+            let n = ids.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)) as ArrayRef,
+                    Arc::new(arrow::array::StringArray::from(vec!["us"; n])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![y2023; n])) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .with_target_file_size(8 * 1024);
+
+    let result = table_writer
+        .append_table("main", "events", &batches)
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, 4000);
+    assert!(
+        result.files_written > 1,
+        "a single partition exceeding target_file_size must roll into several files, got {}",
+        result.files_written
+    );
+
+    // Every file still carries that one partition, and the rows all read back.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), result.files_written);
+    for meta in &page {
+        let mut values = meta.file.partition_values.clone();
+        values.sort_by_key(|(index, _)| *index);
+        let values: Vec<Option<String>> = values.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(
+            values,
+            vec![Some("us".to_string()), Some("2023".to_string())],
+            "every rolled file belongs to the same partition"
+        );
+    }
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        4000
+    );
+}
+
+/// The write entry points that target ONE caller-determined file cannot satisfy a
+/// partition spec that needs one file per partition. They must refuse a partitioned
+/// table with a typed error naming the entry point — never fall through and commit a
+/// file with no partition, which would make the table's layout a lie and silently
+/// break pruning. These are the documented gaps; this test exists so that closing one
+/// is a deliberate act rather than an accident.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_file_entry_points_refuse_a_partitioned_table() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await; // partitioned by (region, year(ts))
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let batches = events_batches();
+    let arrow_schema = batches[0].schema();
+
+    // Embedded-rowid session (the UPDATE row-rewrite path).
+    let err = table_writer
+        .begin_write_with_embedded_rowid("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .expect_err("embedded-rowid write must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("begin_write_with_embedded_rowid"),
+        "the error must name the entry point, got: {err}"
+    );
+
+    // Custom-path session.
+    let err = table_writer
+        .begin_write_to_path(
+            "main",
+            "events",
+            arrow_schema.as_ref(),
+            "/tmp/some-dir",
+            "f.parquet".to_string(),
+            WriteMode::Append,
+        )
+        .expect_err("custom-path write must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("begin_write_to_path"),
+        "the error must name the entry point, got: {err}"
+    );
+
+    // Atomic append+delete (the upsert commit) on a partitioned session.
+    let mut session = table_writer
+        .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batches[0]).unwrap();
+    let err = session
+        .finish_with_deletes(&[])
+        .await
+        .expect_err("append+delete must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("partitioned table"),
+        "the error must say why, got: {err}"
+    );
+
+    // Nothing was committed by any of the three.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    assert!(
+        provider
+            .get_table_file_metadata_page(env.table_id, snap, None, 4096)
+            .unwrap()
+            .is_empty(),
+        "a refused write must commit no data files"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn partitioned_insert_writes_one_file_per_partition() {
     let env = setup().await;
@@ -541,10 +873,11 @@ async fn concurrent_set_during_unpartitioned_insert_conflicts() {
     // Inverse P1: an unpartitioned INSERT plan captured while the table had NO spec,
     // then a concurrent SET PARTITIONED BY makes it partitioned before the plan
     // commits. The commit must abort — never leave a partition_id-less file in a
-    // now-partitioned table.
+    // now-partitioned table, and never silently re-lay-out the rows under a spec the
+    // plan never saw. The caller re-plans against the new spec and retries.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
     let (ctx, _catalog) = writable_catalog(&conn_str).await;
-    // Build the plan now: table is unpartitioned → partition = None.
+    // Build the plan now: table is unpartitioned -> partition = None.
     let plan = ctx
         .sql(INSERT_SQL)
         .await
