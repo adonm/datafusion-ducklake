@@ -5,21 +5,28 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
+    InlinedDataBackend, MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, block_on, inlined_text_projection, is_inlined_data_table, parse_inlined_rows,
     reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("does not exist") || message.contains("undefined table")
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile> {
@@ -100,11 +107,13 @@ macro_rules! bind_repeat {
     };
 }
 
-/// Optional catalog-schema capabilities probed before scan / CDC queries.
+/// Optional catalog-schema capabilities probed before scan / CDC / inlined-data
+/// queries.
 ///
-/// Minimal / pre-v1.0 catalogs may lack the `partial_max` columns and the
-/// `ducklake_schema_versions` ledger; the queries degrade the corresponding
-/// projections to NULL when a capability is absent.
+/// Minimal / pre-v1.0 catalogs may lack the `partial_max` columns, the
+/// `ducklake_schema_versions` ledger, and the inlined-data registry. Queries
+/// degrade the corresponding projections to NULL or skip inlined-data reads
+/// when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
@@ -115,6 +124,8 @@ struct SchemaCapabilities {
     schema_versions: bool,
     /// `ducklake_data_file.partition_id` exists.
     data_file_partition_id: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
@@ -123,6 +134,7 @@ impl SchemaCapabilities {
             && self.delete_file_partial_max
             && self.schema_versions
             && self.data_file_partition_id
+            && self.inlined_data_tables
     }
 }
 
@@ -179,7 +191,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -187,7 +199,8 @@ impl PostgresMetadataProvider {
                        WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
                to_regclass('ducklake_schema_versions') IS NOT NULL,
                EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id')",
+                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
+               to_regclass('ducklake_inlined_data_tables') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -196,6 +209,7 @@ impl PostgresMetadataProvider {
             delete_file_partial_max: row.1,
             schema_versions: row.2,
             data_file_partition_id: row.3,
+            inlined_data_tables: row.4,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -942,6 +956,86 @@ impl MetadataProvider for PostgresMetadataProvider {
                 columns,
                 files,
             })
+        })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<RecordBatch>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let registry = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in registry {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
+                let present = sqlx::query(
+                    "SELECT column_name FROM information_schema.columns
+                     WHERE table_schema = current_schema() AND table_name = $1",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL::text".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::Postgres,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT {projected} FROM {} \
+                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL) \
+                     ORDER BY row_id",
+                    quote_ident(&table)
+                );
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(parse_inlined_rows(schema.clone(), columns, rows)?);
+            }
+            Ok(batches)
         })
     }
 

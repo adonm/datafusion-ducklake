@@ -3,20 +3,25 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
-    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
+    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
     SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
     SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, reconstruct_columns,
-    reconstruct_columns_with_table,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, build_inlined_batch,
+    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use duckdb::AccessMode::ReadOnly;
+use duckdb::types::{TimeUnit as DuckdbTimeUnit, ValueRef};
 use duckdb::{Config, Connection, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
@@ -24,23 +29,148 @@ fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
     message.contains("does not exist") || message.contains("not found")
 }
 
-/// Optional catalog-schema capabilities probed before CDC queries.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn convert_time(value: i64, from: DuckdbTimeUnit, to: TimeUnit) -> Option<i64> {
+    let from_nanos: i128 = match from {
+        DuckdbTimeUnit::Second => 1_000_000_000,
+        DuckdbTimeUnit::Millisecond => 1_000_000,
+        DuckdbTimeUnit::Microsecond => 1_000,
+        DuckdbTimeUnit::Nanosecond => 1,
+    };
+    let to_nanos: i128 = match to {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
+    };
+    i64::try_from(i128::from(value) * from_nanos / to_nanos).ok()
+}
+
+fn duckdb_inlined_scalar(
+    value: ValueRef<'_>,
+    data_type: &DataType,
+    column: &str,
+) -> crate::Result<ScalarValue> {
+    if matches!(value, ValueRef::Null) {
+        return Ok(ScalarValue::try_from(data_type)?);
+    }
+    let scalar = match (data_type, value) {
+        (DataType::Boolean, ValueRef::Boolean(value)) => ScalarValue::Boolean(Some(value)),
+        (DataType::Int8, ValueRef::TinyInt(value)) => ScalarValue::Int8(Some(value)),
+        (DataType::Int16, ValueRef::SmallInt(value)) => ScalarValue::Int16(Some(value)),
+        (DataType::Int32, ValueRef::Int(value)) => ScalarValue::Int32(Some(value)),
+        (DataType::Int64, ValueRef::BigInt(value)) => ScalarValue::Int64(Some(value)),
+        (DataType::UInt8, ValueRef::UTinyInt(value)) => ScalarValue::UInt8(Some(value)),
+        (DataType::UInt16, ValueRef::USmallInt(value)) => ScalarValue::UInt16(Some(value)),
+        (DataType::UInt32, ValueRef::UInt(value)) => ScalarValue::UInt32(Some(value)),
+        (DataType::UInt64, ValueRef::UBigInt(value)) => ScalarValue::UInt64(Some(value)),
+        (DataType::Float32, ValueRef::Float(value)) => ScalarValue::Float32(Some(value)),
+        (DataType::Float64, ValueRef::Double(value)) => ScalarValue::Float64(Some(value)),
+        (DataType::Decimal128(_, _), ValueRef::Decimal(value)) => {
+            crate::types::parse_ducklake_scalar(&value.to_string(), data_type).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data for column '{column}' cannot decode decimal '{value}' as {data_type}"
+                ))
+            })?
+        },
+        (DataType::Date32, ValueRef::Date32(value)) => ScalarValue::Date32(Some(value)),
+        (DataType::Time64(to), ValueRef::Time64(from, value)) => {
+            let value = convert_time(value, from, *to).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data for column '{column}' has an out-of-range time value"
+                ))
+            })?;
+            ScalarValue::Time64Microsecond(Some(value))
+        },
+        (DataType::Timestamp(to, timezone), ValueRef::Timestamp(from, value)) => {
+            let value = convert_time(value, from, *to).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data for column '{column}' has an out-of-range timestamp value"
+                ))
+            })?;
+            match to {
+                TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), timezone.clone()),
+                TimeUnit::Millisecond => {
+                    ScalarValue::TimestampMillisecond(Some(value), timezone.clone())
+                },
+                TimeUnit::Microsecond => {
+                    ScalarValue::TimestampMicrosecond(Some(value), timezone.clone())
+                },
+                TimeUnit::Nanosecond => {
+                    ScalarValue::TimestampNanosecond(Some(value), timezone.clone())
+                },
+            }
+        },
+        (DataType::Interval(_), ValueRef::Interval { months, days, nanos }) => {
+            ScalarValue::new_interval_mdn(months, days, nanos)
+        },
+        (DataType::Utf8, ValueRef::Text(value)) => {
+            ScalarValue::Utf8(Some(decode_duckdb_text(value, column)?))
+        },
+        (DataType::LargeUtf8, ValueRef::Text(value)) => {
+            ScalarValue::LargeUtf8(Some(decode_duckdb_text(value, column)?))
+        },
+        (DataType::Utf8View, ValueRef::Text(value)) => {
+            ScalarValue::Utf8View(Some(decode_duckdb_text(value, column)?))
+        },
+        (DataType::Binary, ValueRef::Blob(value)) => {
+            ScalarValue::Binary(Some(value.to_vec()))
+        },
+        (DataType::LargeBinary, ValueRef::Blob(value)) => {
+            ScalarValue::LargeBinary(Some(value.to_vec()))
+        },
+        (DataType::BinaryView, ValueRef::Blob(value)) => {
+            ScalarValue::BinaryView(Some(value.to_vec()))
+        },
+        (DataType::FixedSizeBinary(size), ValueRef::Text(value)) => {
+            let value = decode_duckdb_text(value, column)?;
+            crate::types::parse_ducklake_scalar(&value, data_type).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data for column '{column}' cannot decode '{value}' as fixed-size binary {size}"
+                ))
+            })?
+        },
+        (data_type, value) => {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "inlined data for column '{column}' has DuckDB type {:?}, which cannot be decoded \
+                 as {data_type}; {INLINED_DATA_REMEDIATION}",
+                value.data_type(),
+            )));
+        },
+    };
+    Ok(scalar)
+}
+
+fn decode_duckdb_text(value: &[u8], column: &str) -> crate::Result<String> {
+    std::str::from_utf8(value).map(str::to_owned).map_err(|e| {
+        crate::DuckLakeError::Unsupported(format!(
+            "inlined data for column '{column}' contains invalid UTF-8: {e}"
+        ))
+    })
+}
+
+/// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
 ///
-/// Older catalogs (spec 0.2) may lack the `partial_max` columns; the CDC
-/// queries fall back to the old-spec `partial_file_info` string (data files)
-/// or degrade the predicate to NULL (delete files) when a capability is
-/// absent.
+/// Older catalogs (spec 0.2) may lack the `partial_max` columns and the
+/// inlined-data registry. CDC queries fall back to the old-spec
+/// `partial_file_info` string (data files) or degrade the predicate to NULL
+/// (delete files); inlined-data reads return empty when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max
+        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
     }
 }
 
@@ -100,18 +230,25 @@ impl DuckdbMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let (data_file_partial_max, delete_file_partial_max): (bool, bool) = conn.query_row(
+        let (data_file_partial_max, delete_file_partial_max, inlined_data_tables): (
+            bool,
+            bool,
+            bool,
+        ) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
-                WHERE name = 'partial_max') > 0",
+                WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_name = 'ducklake_inlined_data_tables') > 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
+            inlined_data_tables,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -698,6 +835,86 @@ impl MetadataProvider for DuckdbMetadataProvider {
         })
     }
 
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> crate::Result<Vec<RecordBatch>> {
+        let conn = self.connection();
+        if !self.schema_capabilities(&conn)?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let mut registry =
+            conn.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
+        let tables = registry
+            .query_map([table_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+        let mut batches = Vec::new();
+
+        for table in tables {
+            if !is_inlined_data_table(&table) {
+                continue;
+            }
+            let info_sql = format!("SELECT name FROM pragma_table_info('{table}')");
+            let mut info = conn.prepare(&info_sql)?;
+            let present = info
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            let projected = columns
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    if !present.contains(&column.column_name) {
+                        return "NULL".to_string();
+                    }
+                    let ident = quote_ident(&column.column_name);
+                    if matches!(
+                        field.data_type(),
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                            | DataType::FixedSizeBinary(_)
+                    ) {
+                        format!("CAST({ident} AS VARCHAR)")
+                    } else {
+                        ident
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {projected} FROM {} \
+                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                 ORDER BY row_id",
+                quote_ident(&table)
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let mut query = statement.query(params![snapshot_id, snapshot_id])?;
+            let mut rows = Vec::new();
+            while let Some(row) = query.next()? {
+                let values = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        duckdb_inlined_scalar(
+                            row.get_ref(index)?,
+                            field.data_type(),
+                            &columns[index].column_name,
+                        )
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                rows.push(values);
+            }
+            if !rows.is_empty() {
+                batches.push(build_inlined_batch(schema.clone(), columns, &rows)?);
+            }
+        }
+        Ok(batches)
+    }
+
     fn get_schema_by_name(
         &self,
         name: &str,
@@ -1045,8 +1262,38 @@ fn parse_partial_file_info_max(info: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod partial_file_info_tests {
-    use super::parse_partial_file_info_max;
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field};
+    use duckdb::arrow::array::{Int32Builder, ListBuilder};
+    use duckdb::types::{ListType, ValueRef};
+
+    use super::{duckdb_inlined_scalar, parse_partial_file_info_max};
+
+    #[test]
+    fn nested_inlined_value_reports_recovery() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        let values = builder.finish();
+        let target = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let error = duckdb_inlined_scalar(
+            ValueRef::List(ListType::Regular(&values), 0),
+            &target,
+            "tags",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Unsupported feature: inlined data for column 'tags' has DuckDB type List(Int), \
+             which cannot be decoded as List(Int32); flush inlined data to Parquet (or disable \
+             data inlining at write time)"
+        );
+    }
 
     #[test]
     fn parses_multi_pair_info() {

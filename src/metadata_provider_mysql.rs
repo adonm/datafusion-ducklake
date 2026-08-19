@@ -5,17 +5,20 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
-    reconstruct_columns, reconstruct_columns_with_table,
+    InlinedDataBackend, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC,
+    SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
+    inlined_text_projection, is_inlined_data_table, parse_inlined_rows, reconstruct_columns,
+    reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::NaiveDateTime;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
@@ -23,6 +26,10 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("doesn't exist")
         || message.contains("does not exist")
         || message.contains("unknown table")
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }
 
 fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFile> {
@@ -64,22 +71,24 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
     })
 }
 
-/// Optional catalog-schema capabilities probed before CDC queries.
+/// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
 ///
-/// Older catalogs may lack the `partial_max` columns; the CDC queries degrade
-/// the corresponding projections/predicates to NULL when a capability is
-/// absent.
+/// Older catalogs may lack the `partial_max` columns and the inlined-data
+/// registry. CDC queries degrade the corresponding projections/predicates to
+/// NULL, and inlined-data reads return empty when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max
+        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
     }
 }
 
@@ -136,7 +145,7 @@ impl MySqlMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (i64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64) = sqlx::query_as(
             "SELECT
                (SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_schema = DATABASE()
@@ -145,13 +154,17 @@ impl MySqlMetadataProvider {
                (SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_schema = DATABASE()
                   AND table_name = 'ducklake_delete_file'
-                  AND column_name = 'partial_max')",
+                  AND column_name = 'partial_max'),
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'ducklake_inlined_data_tables')",
         )
         .fetch_one(&self.pool)
         .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.0 > 0,
             delete_file_partial_max: row.1 > 0,
+            inlined_data_tables: row.2 > 0,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -780,6 +793,86 @@ impl MetadataProvider for MySqlMetadataProvider {
                 columns,
                 files,
             })
+        })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<RecordBatch>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let registry = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in registry {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
+                let present = sqlx::query(
+                    "SELECT column_name FROM information_schema.columns
+                     WHERE table_schema = DATABASE() AND table_name = ?",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::MySql,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT {projected} FROM {} \
+                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                     ORDER BY row_id",
+                    quote_ident(&table)
+                );
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(parse_inlined_rows(schema.clone(), columns, rows)?);
+            }
+            Ok(batches)
         })
     }
 
