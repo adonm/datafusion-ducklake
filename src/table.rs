@@ -1016,10 +1016,15 @@ impl DuckLakeTable {
     /// for `predicate` — every file that could hold a matching row, and none that
     /// is provably empty of them.
     ///
-    /// This is the file-level pruning a `SELECT` with the same filter already
-    /// performs, exposed for callers that drive their own per-file work instead
-    /// of a scan: a keyed update, an upsert, or a delete that resolves row
-    /// positions file by file with [`Self::resolve_positions`]. Without it such a
+    /// This is the file-level pruning a `SELECT` with the same filter performs,
+    /// exposed for callers that drive their own per-file work instead of a scan:
+    /// a keyed update, an upsert, or a delete that resolves row positions file by
+    /// file with [`Self::resolve_positions`]. It prunes *further* than a scan in
+    /// one respect. A scan applies delete files, so it treats a delete-bearing
+    /// file's recorded bounds as approximate and keeps the file; these callers do
+    /// not apply them, so for them the bounds still hold and the file can be
+    /// dropped (see `restate_in_physical_row_space`). Every file a scan would
+    /// keep for any other reason is kept here too. Without it such a
     /// caller must open every data file to discover which ones contain a key,
     /// which costs the whole table on every mutation. `predicate` is the same
     /// [`PhysicalExpr`] those callers pass to [`Self::resolve_positions`], so one
@@ -1117,7 +1122,8 @@ impl DuckLakeTable {
 
         let mut matching = Vec::new();
         for metadata in self.file_metadata_pages("file matching") {
-            let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
+            let (table_files, mut file_statistics) = self.page_files_with_statistics(metadata?);
+            restate_in_physical_row_space(&mut file_statistics, &table_files);
             #[cfg(feature = "encryption")]
             self.collect_encryption_keys(&mut encryption_keys, &table_files)?;
             matching.extend(
@@ -1325,7 +1331,9 @@ impl DuckLakeTable {
     /// estimates, so downstream planning sees only the relevant files.
     ///
     /// A file with a live delete file has `Inexact` statistics because its
-    /// recorded min/max may cover deleted rows. Such a file is kept. A file is
+    /// recorded min/max may cover deleted rows, and such a file is kept — unless
+    /// the caller has already re-stated those bounds for a reader that does not
+    /// apply deletes, which [`DuckLakeTable::files_matching`] does. A file is
     /// only removed when its own exact statistics prove it cannot match, and any
     /// pruning error abandons the whole attempt: it returns `candidates` — every
     /// input file bar the proven-empty ones — and so gives back files an earlier
@@ -3412,6 +3420,74 @@ fn sort_ordering_for(
     Ok(datafusion::physical_expr::LexOrdering::new(sort_exprs))
 }
 
+/// Re-state a page's per-file statistics for a caller that reads a data file
+/// **without applying its delete file**.
+///
+/// [`build_datafusion_statistics`] marks a delete-bearing file's recorded bounds
+/// [`Precision::Inexact`], and [`FilePruningStatistics`] prunes only on `Exact`
+/// ones. So the first mutation that writes a delete file also stops that file
+/// contributing usable bounds, and every later call opens it whatever its key
+/// range. Nothing restores them: compaction skips delete-bearing files.
+///
+/// Those bounds stay usable for this caller. [`DuckLakeTable::resolve_positions`]
+/// scans physical rows and does not apply delete files — it exists to compute
+/// the positions a delete file records — so a recorded bound still contains
+/// every row it can see, and `null_count`, harvested from the parquet footer,
+/// still counts them.
+///
+/// `Exact` here is DataFusion's word for "usable", not a claim of a true
+/// extreme. The DuckLake spec requires `min_value`/`max_value` only to be a
+/// lower and upper bound ("does not have to be exact"), and this promotes them
+/// no further than that: a bound over the physical rows is still a bound over
+/// any subset of them, which is what makes it valid for a delete-applying
+/// reader too.
+///
+/// This promotes every `Inexact` bound on such a file, including the widened
+/// envelopes [`DuckLakeTable::apply_partition_bounds`] synthesises, which it
+/// leaves `Inexact` so they cannot be mistaken for real extrema. That is
+/// deliberate and safe for pruning — an envelope is a true bound — and safe
+/// only because the map this returns lives and dies inside
+/// [`DuckLakeTable::files_matching`]. It must not reach scan or aggregate
+/// statistics, where an envelope presented as an extreme could answer a
+/// MIN/MAX-from-statistics query wrongly.
+///
+/// The live row count is deliberately left out. [`file_row_count`] subtracts
+/// `delete_count`, making it the one figure deletes genuinely change. Promoting
+/// it alongside a physical `null_count` would be unsound rather than imprecise:
+/// DataFusion guards a comparison with `null_count != row_count`, so a file with
+/// two physical rows — one NULL, one matching, the NULL deleted — would present
+/// `null_count == row_count`, be judged entirely null, and be dropped while
+/// still physically holding the row the caller must find. Withholding the count
+/// leaves that rewrite inert.
+fn restate_in_physical_row_space(
+    statistics: &mut HashMap<i64, Arc<Statistics>>,
+    files: &[DuckLakeTableFile],
+) {
+    fn physical<T: Clone + std::fmt::Debug + Eq + PartialOrd>(
+        value: &Precision<T>,
+    ) -> Precision<T> {
+        match value {
+            Precision::Inexact(value) => Precision::Exact(value.clone()),
+            other => other.clone(),
+        }
+    }
+
+    for file in files.iter().filter(|f| f.delete_file.is_some()) {
+        let Some(current) = statistics.get(&file.data_file_id) else {
+            continue;
+        };
+        let mut restated = current.as_ref().clone();
+        // Not physical: this is live rows, deletes already subtracted.
+        restated.num_rows = Precision::Absent;
+        for column in &mut restated.column_statistics {
+            column.min_value = physical(&column.min_value);
+            column.max_value = physical(&column.max_value);
+            column.null_count = physical(&column.null_count);
+        }
+        statistics.insert(file.data_file_id, Arc::new(restated));
+    }
+}
+
 struct FilePruningStatistics {
     base: PrunableStatistics,
     statistics: Vec<Arc<Statistics>>,
@@ -4063,6 +4139,129 @@ mod tests {
             .into_iter()
             .map(|file| file.data_file_id)
             .collect())
+    }
+
+    #[test]
+    fn files_matching_does_not_judge_a_delete_bearing_file_all_null() -> Result<()> {
+        // The hazard the restatement is built around, and the one the simpler
+        // test above cannot see because its files have no nulls.
+        //
+        // `null_count` is physical (parquet footer) while `file_row_count` is
+        // live (deletes subtracted). Present both as usable and DataFusion's
+        // `null_count != row_count` guard reads two physical rows -- one NULL,
+        // one matching -- with the NULL deleted as "one null, one row, so
+        // entirely null", and prunes a file that still physically holds the row
+        // the caller has to find. Withholding the row count is what stops that,
+        // so this fails if a future change promotes it.
+        let mut entry = fixture_file(1, None, Some((5, 5)));
+        entry.file.max_row_count = Some(2); // physical: [NULL, 5]
+        entry.file.delete_count = Some(1); // the NULL is deleted -> 1 live row
+        entry.file.delete_file_id = Some(1);
+        entry.file.delete_file = Some(DuckLakeFileData::new(
+            "delete-1.parquet".to_string(),
+            true,
+            1,
+        ));
+        for stats in &mut entry.column_statistics {
+            stats.null_count = Some(1);
+            stats.value_count = Some(2);
+        }
+
+        let table = fixed_table(vec![entry], None)?;
+        let predicate = physical_predicate(&table, col("id").eq(lit(5_i64)));
+        assert_eq!(
+            matching_ids(&table, &predicate)?,
+            vec![1],
+            "a physical null_count equal to the LIVE row count must not make the \
+             file look entirely null -- the matching physical row is still there"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn files_matching_prunes_a_delete_bearing_file_by_its_partition_bound() -> Result<()> {
+        // Same fixture and predicate as
+        // `files_matching_prunes_a_partition_column_without_column_statistics`,
+        // with one variable changed: the file that must be pruned carries a
+        // delete file. Its only bound is the one `apply_partition_bounds`
+        // synthesises, which the restatement also promotes -- so this pins that
+        // a delete-bearing file is still prunable when partition values are all
+        // it has, which is the shape a partitioned keyed mutation actually hits.
+        let delete_bearing = |data_file_id: i64, value: &'static str| {
+            let mut entry = fixture_file(data_file_id, Some(Some(value)), None);
+            entry.file.max_row_count = Some(10);
+            entry.file.delete_count = Some(1);
+            entry.file.delete_file_id = Some(data_file_id);
+            entry.file.delete_file = Some(DuckLakeFileData::new(
+                format!("delete-{data_file_id}.parquet"),
+                true,
+                1,
+            ));
+            entry
+        };
+
+        let table = fixed_table(
+            vec![fixture_file(1, Some(Some("10")), None), delete_bearing(2, "9999")],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
+        assert_eq!(
+            matching_ids(&table, &predicate)?,
+            vec![1],
+            "a delete-bearing file whose partition bound excludes the value must \
+             still prune"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn files_matching_still_prunes_a_file_that_carries_deletes() -> Result<()> {
+        // `build_datafusion_statistics` marks a delete-bearing file's bounds
+        // Inexact, and the pruning view surfaces only Exact ones. So without the
+        // physical-space restatement, the first mutation that writes a delete
+        // file makes that file unprunable for every mutation after it — and
+        // permanently, because compaction skips delete-bearing files. Both
+        // directions are asserted: the file must still be dropped when its
+        // bounds exclude the value, and still kept when they do not.
+        let carrying_deletes = |data_file_id: i64, id_bounds: (i64, i64)| {
+            let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
+            // Leave live rows > 0, so the separate known-empty exclusion is not
+            // what drops the file.
+            entry.file.max_row_count = Some(10);
+            entry.file.delete_count = Some(1);
+            entry.file.delete_file_id = Some(data_file_id);
+            entry.file.delete_file = Some(DuckLakeFileData::new(
+                format!("delete-{data_file_id}.parquet"),
+                true,
+                1,
+            ));
+            entry
+        };
+
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                carrying_deletes(2, (100, 110)),
+                fixture_file(3, None, Some((200, 210))),
+            ],
+            None,
+        )?;
+
+        let inside = physical_predicate(&table, col("id").eq(lit(105_i64)));
+        assert_eq!(
+            matching_ids(&table, &inside)?,
+            vec![2],
+            "a delete-bearing file whose bounds admit the value must be kept"
+        );
+
+        let outside = physical_predicate(&table, col("id").eq(lit(5_i64)));
+        assert_eq!(
+            matching_ids(&table, &outside)?,
+            vec![1],
+            "a delete-bearing file whose bounds exclude the value must still prune"
+        );
+        Ok(())
     }
 
     #[test]
