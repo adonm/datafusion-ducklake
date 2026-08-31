@@ -14,10 +14,9 @@ use crate::metadata_provider::{
 use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
-use crate::positional_source::PositionalFileSource;
 use crate::row_id::{
-    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, ROWID_COLUMN_NAME, RowIdExec,
-    SNAPSHOT_ID_PARQUET_FIELD_ID, rowid_field,
+    ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, SNAPSHOT_ID_PARQUET_FIELD_ID,
+    positional_table_schema, rowid_field,
 };
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::types::{
@@ -54,11 +53,11 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
@@ -298,17 +297,30 @@ fn validate_column_defaults(columns: &[DuckLakeTableColumn]) -> Result<HashMap<S
     Ok(defaults)
 }
 
-/// Whether a stored float `max_value` is a usable upper bound.
+/// Whether a stored float `min_value` / `max_value` is a usable bound.
 ///
-/// Catalog min/max exclude NaN, and NaN sorts above every value in both DuckDB
-/// and DataFusion (IEEE 754 totalOrder) — so a float column whose NaN state is
-/// unknown (`None`, e.g. register-by-reference loads) or positive (`Some(true)`,
-/// e.g. stats written by official DuckLake's INSERT) may hold values above its
-/// recorded max, and pruning `x > C` on that max would wrongly drop rows. The
-/// recorded min needs no such gate: NaN can never sit below it, so `min <= v`
-/// holds for every value including NaN. Mirrors official DuckLake, which ORs
-/// `contains_nan` into its greater-than filter SQL.
-fn float_max_is_bound(data_type: &DataType, contains_nan: Option<bool>) -> bool {
+/// Catalog min/max exclude NaN, so a float column whose NaN state is unknown
+/// (`None`, e.g. register-by-reference loads) or positive (`Some(true)`, e.g.
+/// stats written by official DuckLake's INSERT) may hold values outside its
+/// recorded bounds, and pruning on them would wrongly drop rows.
+///
+/// **Both** bounds need the gate here, which is where this deliberately differs
+/// from official DuckLake — an engine-layer difference, not a format one.
+///
+/// Official gates only the max, and that is correct for DuckDB, which
+/// normalizes NaN: `-NaN = NaN` is true and either sign sorts above every
+/// value, so NaN can only ever hide above a recorded max. DataFusion compares
+/// floats with arrow's `total_cmp`, which is sign-sensitive:
+/// `(-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)` is `true` here and
+/// `false` in DuckDB. A negative NaN therefore sits *below* a recorded min in
+/// this engine, and `contains_nan` does not record the sign — so neither bound
+/// can be trusted.
+///
+/// Gating both is what keeps pruning consistent with the filter semantics this
+/// engine actually has. The underlying `total_cmp`-vs-DuckDB ordering
+/// difference is inherited from arrow and predates this gate; it is visible in
+/// query *results* for `±NaN` comparisons, not only in pruning.
+fn float_bound_is_usable(data_type: &DataType, contains_nan: Option<bool>) -> bool {
     !matches!(
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -422,9 +434,13 @@ fn build_datafusion_statistics(
                     }
                 })
                 .unwrap_or(Precision::Absent);
-            column_statistics.min_value =
-                scalar_precision(raw.min_value.as_deref(), column, field_type, exact);
-            column_statistics.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+            let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);
+            column_statistics.min_value = if bounds_usable {
+                scalar_precision(raw.min_value.as_deref(), column, field_type, exact)
+            } else {
+                Precision::Absent
+            };
+            column_statistics.max_value = if bounds_usable {
                 scalar_precision(raw.max_value.as_deref(), column, field_type, exact)
             } else {
                 Precision::Absent
@@ -492,13 +508,18 @@ fn build_datafusion_statistics(
             if raw.contains_null == Some(false) {
                 output.null_count = Precision::Exact(0);
             }
-            output.min_value = scalar_precision(
-                raw.min_value.as_deref(),
-                column,
-                field_type,
-                raw.bounds_are_exact,
-            );
-            output.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+            let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);
+            output.min_value = if bounds_usable {
+                scalar_precision(
+                    raw.min_value.as_deref(),
+                    column,
+                    field_type,
+                    raw.bounds_are_exact,
+                )
+            } else {
+                Precision::Absent
+            };
+            output.max_value = if bounds_usable {
                 scalar_precision(
                     raw.max_value.as_deref(),
                     column,
@@ -564,11 +585,14 @@ fn build_datafusion_statistics(
 
             let all_null =
                 matches!((raw.value_count, raw.null_count), (Some(v), Some(n)) if v == n);
-            match raw
+            // An unusable float min (NaN state unknown/positive) is treated the
+            // same way as an unusable max below: negative NaN sorts beneath
+            // every value, so the recorded min is not a lower bound.
+            let usable_min = raw
                 .min_value
                 .as_deref()
-                .and_then(|value| parse_statistic_scalar(value, column, field_type))
-            {
+                .filter(|_| float_bound_is_usable(field_type, raw.contains_nan));
+            match usable_min.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     min_value = match min_value {
                         Some(current) => current.partial_cmp(&value).map(|ordering| {
@@ -585,13 +609,13 @@ fn build_datafusion_statistics(
                 None if all_null => {},
                 None => min_complete = false,
             }
-            // An unusable float max (NaN state unknown/positive) is treated as
-            // absent: with `all_null` it contributes nothing, otherwise it
-            // poisons `max_complete` so the aggregate max degrades to unknown.
+            // An unusable float bound is treated as absent: with `all_null` it
+            // contributes nothing, otherwise it poisons `max_complete` so the
+            // aggregate degrades to unknown.
             let usable_max = raw
                 .max_value
                 .as_deref()
-                .filter(|_| float_max_is_bound(field_type, raw.contains_nan));
+                .filter(|_| float_bound_is_usable(field_type, raw.contains_nan));
             match usable_max.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     max_value = match max_value {
@@ -692,6 +716,22 @@ struct FileReadConfig {
     /// (parquet column → `"rowid"`) when the file has an embedded column with
     /// a different name.
     name_mapping: HashMap<String, String>,
+    /// Number of row groups in the file. A scan cannot usefully be split into
+    /// more partitions than this — see [`DuckLakeTable::split_across_partitions`].
+    row_group_count: usize,
+    /// Catalog column indices whose physical name in THIS file differs from the
+    /// catalog name — a rename, or the placeholder given to a column the file
+    /// predates.
+    ///
+    /// Indices rather than a flag, and derived positionally rather than from
+    /// `name_mapping`, for two reasons. `name_mapping` also carries the
+    /// synthetic `_ducklake_internal_row_id -> rowid` entry that every
+    /// embedded-rowid file gets, so its emptiness says nothing about data
+    /// columns. And a whole-file flag would refuse pushdown for every predicate
+    /// on a file that has had any `ADD COLUMN`, however unrelated — see
+    /// [`DuckLakeTable::predicate_is_prunable`], which rejects only a predicate
+    /// that actually references one of these.
+    renamed_column_indices: Arc<HashSet<usize>>,
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
@@ -710,17 +750,6 @@ struct FileReadConfig {
     /// column's data would be lost (and its sources removed). `merge_adjacent_files`
     /// skips any group containing one.
     drops_current_columns: bool,
-    /// Per-row-group starting physical row position (prefix sums of
-    /// `row_groups[i].num_rows()`). `row_group_starts[i]` is the 0-based file
-    /// position of the first row of row group `i`. Used to build row-group-
-    /// aligned scan partitions whose starting position is known at plan time,
-    /// so `FileRowNumberExec` can synthesize true physical positions instead of
-    /// counting stream arrivals. The Parquet footer is the source of truth; the
-    /// catalog does not store per-row-group counts.
-    row_group_starts: Vec<i64>,
-    /// Number of row groups in the file (`row_group_starts.len()`). Required to
-    /// build a `ParquetAccessPlan` of the correct length.
-    row_group_count: usize,
 }
 
 /// What one file's parquet footer says: the field-id → physical-name map, the
@@ -734,10 +763,8 @@ pub(crate) struct ParquetFooterFacts {
     pub(crate) field_ids: HashMap<i32, String>,
     /// The arrow schema the parquet reader derives for this file.
     pub(crate) arrow_schema: SchemaRef,
-    /// Per-row-group starting physical row position (prefix sums of
-    /// `row_groups[i].num_rows()`).
-    pub(crate) row_group_starts: Vec<i64>,
-    /// Number of row groups (`row_group_starts.len()`).
+    /// Number of row groups in the file. Bounds how far a scan of it can
+    /// usefully be split across partitions.
     pub(crate) row_group_count: usize,
 }
 
@@ -762,7 +789,7 @@ pub(crate) struct ParquetFileLayout {
     /// True if the file carries a data column that is NOT in the table's current
     /// schema — a column dropped since the file was written.
     pub(crate) drops_current_columns: bool,
-    pub(crate) row_group_starts: Vec<i64>,
+    /// Number of row groups in the file.
     pub(crate) row_group_count: usize,
 }
 
@@ -816,23 +843,10 @@ pub(crate) async fn read_parquet_footer_facts(
 
     let field_ids = extract_parquet_field_ids(builder.metadata());
 
-    // Per-row-group starting positions (prefix sums of num_rows), read from the
-    // footer we already have open. Drives row-group-aligned scan partitioning on
-    // positional paths.
-    let row_groups = builder.metadata().row_groups();
-    let row_group_count = row_groups.len();
-    let mut row_group_starts = Vec::with_capacity(row_group_count);
-    let mut row_acc: i64 = 0;
-    for rg in row_groups {
-        row_group_starts.push(row_acc);
-        row_acc = row_acc.saturating_add(rg.num_rows());
-    }
-
     Ok(ParquetFooterFacts {
         field_ids,
         arrow_schema: builder.schema().clone(),
-        row_group_starts,
-        row_group_count,
+        row_group_count: builder.metadata().row_groups().len(),
     })
 }
 
@@ -887,7 +901,6 @@ pub(crate) async fn read_parquet_file_layout(
         embedded_rowid_parquet_name: facts.field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
         embedded_snapshot_parquet_name: facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
         drops_current_columns,
-        row_group_starts: facts.row_group_starts,
         row_group_count: facts.row_group_count,
     }))
 }
@@ -1214,23 +1227,30 @@ impl DuckLakeTable {
     /// Build a DataFusion file descriptor and attach the catalog's file-level
     /// statistics. `include_rowid` adds an unknown trailing statistic for an
     /// embedded rowid column so the vector still matches the scan schema.
+    /// A [`PartitionedFile`] for `file`: its resolved path, validated size, and
+    /// the catalog's footer-size hint when it has one.
+    fn partitioned_file(&self, file: &DuckLakeFileData) -> DataFusionResult<PartitionedFile> {
+        let resolved_path = self.resolve_file_path(file)?;
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(file.file_size_bytes, &resolved_path)?,
+        );
+        if let Some(footer_size) = file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        Ok(pf)
+    }
+
     fn partitioned_data_file(
         &self,
         table_file: &DuckLakeTableFile,
         include_rowid: bool,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> DataFusionResult<PartitionedFile> {
-        let resolved_path = self.resolve_file_path(&table_file.file)?;
-        let mut file = PartitionedFile::new(
-            &resolved_path,
-            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-        );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
-            file = file.with_metadata_size_hint(hint);
-        }
+        let mut file = self.partitioned_file(&table_file.file)?;
         if let Some(statistics) = file_statistics.get(&table_file.data_file_id) {
             let statistics = if include_rowid {
                 let mut statistics = statistics.as_ref().clone();
@@ -1505,7 +1525,13 @@ impl DuckLakeTable {
     }
 
     /// Create a ParquetSource with encryption support if enabled and needed
-    fn create_parquet_source(&self, schema: SchemaRef) -> ParquetSource {
+    /// Build the parquet source for a scan, with the table's encryption factory
+    /// attached when one is installed.
+    ///
+    /// Accepts either a plain file schema or a [`TableSchema`] — the latter is
+    /// how a *positional* scan asks the reader for the physical-position virtual
+    /// column (see [`positional_table_schema`]).
+    fn create_parquet_source(&self, schema: impl Into<TableSchema>) -> ParquetSource {
         #[cfg(feature = "encryption")]
         if let Some(factory) = self.encryption_factory.lock().unwrap().as_ref().cloned() {
             return ParquetSource::new(schema).with_encryption_factory(factory);
@@ -1641,10 +1667,11 @@ impl DuckLakeTable {
     /// by a delete file's `pos` column and
     /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
-    /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
-    /// is a possible optimization — but any such pushdown must exclude float
-    /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
-    /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
+    /// `predicate` is pushed into the reader for row-group/bloom pruning only
+    /// when `predicate_is_prunable` allows: never for a float predicate
+    /// (footer bounds exclude NaN, and a hidden NaN row is one a DELETE fails to
+    /// delete), and never for a file carrying a physical rename. Otherwise the
+    /// whole file is scanned.
     ///
     /// Valid for every data file, including one rewritten by an UPDATE or by
     /// compaction. A delete file's `pos` is the row's **physical** index in the
@@ -1660,11 +1687,11 @@ impl DuckLakeTable {
         data_file: &DuckLakeFileData,
         predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     ) -> DataFusionResult<HashSet<i64>> {
-        // Positional scan of the data file: read the physical data columns and
-        // materialize the true physical row position (`ROW_POS_COLUMN_NAME`) via
-        // `FileRowNumberExec`, WITHOUT applying any delete files. Then evaluate
-        // `predicate` per batch and collect the physical positions of matching
-        // rows — exactly the `pos` values a positional delete file records.
+        // Positional scan of the data file: read the physical data columns and the
+        // reader-produced physical row position, WITHOUT applying any delete
+        // files. Then evaluate `predicate` per batch and collect the physical
+        // positions of matching rows — exactly the `pos` values a positional
+        // delete file records.
         //
         // `predicate` is expressed against the table's logical column order
         // (column index i = the i-th logical/data field); `Column::evaluate` is
@@ -1678,31 +1705,32 @@ impl DuckLakeTable {
         // line up with the table's logical order.
         let file_cfg = self.build_file_read_config(state, data_file).await?;
 
-        // Row-group-aligned partitions + a non-repartition, non-pruning source so
-        // `FileRowNumberExec` yields true physical positions (mirrors the scan
-        // paths in `build_exec_for_file_with_rowid`).
-        let target_partitions = state.config().target_partitions();
-        let (file_groups, partition_starts) =
-            self.build_row_group_partitions(data_file, &file_cfg, target_partitions)?;
+        // Physical data columns only (logical order), then the reader-produced
+        // position column. Embedded/rowid columns are not needed to evaluate the
+        // predicate or read positions.
+        let (table_schema, pos_table_idx, _pos_name) =
+            positional_table_schema(file_cfg.read_schema.clone());
+        let mut proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
+        proj.push(pos_table_idx);
+        let pos_idx = proj.len() - 1;
 
-        let source = PositionalFileSource::wrap(Arc::new(
-            self.create_parquet_source(file_cfg.read_schema.clone()),
-        ));
-        // Physical data columns only (logical order); embedded/rowid columns are
-        // not needed to evaluate the predicate or read positions.
-        let physical_proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
-        let num_file_groups = file_groups.len();
-        let scan = DataSourceExec::from_data_source(
-            self.scan_config_builder(source)
-                .with_file_groups(file_groups)
-                .with_output_partitioning(Some(
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
-                ))
-                .with_projection_indices(Some(physical_proj))?
+        // Hand the predicate to the reader when it is safe to prune on, so a
+        // DELETE/UPDATE reads only the row groups that can contain matches
+        // instead of every row of the file. Positions stay true under pruning
+        // because the reader derives them from row-group offsets, and a row the
+        // reader drops could not have matched anyway.
+        let mut source = self.create_parquet_source(table_schema);
+        if self.predicate_is_prunable(&predicate, &file_cfg) {
+            source = source.with_predicate(Arc::clone(&predicate));
+        }
+
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            self.scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![self.partitioned_file(data_file)?]))
+                .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(FileRowNumberExec::new(scan, partition_starts));
-        let pos_idx = plan.schema().index_of(ROW_POS_COLUMN_NAME)?;
+        let plan = self.split_across_partitions(plan, state, &file_cfg)?;
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
@@ -1722,7 +1750,7 @@ impl DuckLakeTable {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+                    DataFusionError::Internal("physical-position column is not Int64".to_string())
                 })?;
             for i in 0..batch.num_rows() {
                 // A NULL predicate result is treated as non-match (SQL semantics).
@@ -2004,7 +2032,7 @@ impl DuckLakeTable {
     /// exclude NaN) must not drive row-group/page pruning for predicates on
     /// them. Detected via the already-gated per-file statistics: a float
     /// column with an `Absent` max is exactly one whose `contains_nan` isn't
-    /// known false (see `float_max_is_bound`); a file with no statistics entry
+    /// known false (see `float_bound_is_usable`); a file with no statistics entry
     /// is unknown across the board.
     fn nan_unsafe_float_columns(
         &self,
@@ -2034,6 +2062,116 @@ impl DuckLakeTable {
             }
         }
         Arc::new(unsafe_columns)
+    }
+
+    /// Split a freshly built scan across `target_partitions` byte ranges.
+    ///
+    /// The read paths get this from the physical optimizer's
+    /// `repartition_file_scans` rule. The paths that build a plan and run it
+    /// themselves — `resolve_positions`, the UPDATE source scan, the compaction
+    /// rewrite — never reach that rule (they go straight to
+    /// `physical_plan::collect` / `execute`), so they ask for the split here.
+    ///
+    /// Safe because the physical row position comes from the reader, not from
+    /// arrival order: every consumer on these paths reads positions out of the
+    /// column, so a byte-range split cannot move a row's position. The scan this
+    /// replaced did its own row-group-aligned splitting for the same reason, and
+    /// dropping it without this would have made these paths single-threaded.
+    ///
+    /// Capped at the file's row-group count, because DataFusion splits purely by
+    /// byte size and has no idea how many row groups a file has: asking for 8
+    /// partitions of a 2-row-group file yields 6 that read nothing and 8 that
+    /// each fetch the footer, since these scans install no shared metadata
+    /// cache. The partitioning this replaced capped the same way.
+    ///
+    /// Skipped entirely when `optimizer.repartition_file_scans` is off, so these
+    /// paths honour the setting the read paths get from the optimizer rule.
+    ///
+    /// Falls back to `plan` unchanged if the source declines to split.
+    fn split_across_partitions(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+        file_cfg: &FileReadConfig,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let options = state.config_options();
+        if !options.optimizer.repartition_file_scans {
+            return Ok(plan);
+        }
+        let target = state
+            .config()
+            .target_partitions()
+            .min(file_cfg.row_group_count.max(1));
+        if target <= 1 {
+            return Ok(plan);
+        }
+        Ok(plan.repartitioned(target, options)?.unwrap_or(plan))
+    }
+
+    /// Whether `predicate` may be pushed into the parquet reader for a
+    /// [`Self::resolve_positions`] scan of a file described by `file_cfg`.
+    ///
+    /// Deliberately stricter than the read path's `NanPruningBarrierExec`, on
+    /// two counts:
+    ///
+    /// - **Any float reference disqualifies the predicate**, not just one whose
+    ///   file is not known NaN-free. Parquet footer float bounds exclude NaN
+    ///   while `NaN > C` evaluates true, so pruning on them can hide a matching
+    ///   NaN row — and here a hidden row is not a missing result but a row a
+    ///   DELETE silently fails to delete. The read path can afford the precise
+    ///   test because it has the catalog's per-file statistics; this path is
+    ///   handed a bare [`DuckLakeFileData`] and has none. Plumbing them through
+    ///   would let float predicates prune here too.
+    ///
+    /// - **A predicate referencing a column this file names differently is
+    ///   disqualified.** The predicate carries catalog column *names*, and the
+    ///   reader resolves a pushed predicate by name against the file's schema,
+    ///   which uses the physical names. There is no `ColumnRenameExec` on this
+    ///   path to rewrite them (`resolve_positions` evaluates positionally
+    ///   instead), so such a column would fail to bind — and an unbindable
+    ///   column folds the predicate to false, which prunes every row group and
+    ///   deletes nothing.
+    ///
+    ///   Only the columns the predicate actually references matter, hence
+    ///   [`FileReadConfig::renamed_column_indices`] rather than a per-file flag:
+    ///   a file older than any `ADD COLUMN` names that column with a
+    ///   placeholder, and refusing every predicate on such a file would give up
+    ///   pruning on the whole history of a table that has ever gained a column.
+    ///
+    /// Both rejections fall back to scanning the whole file, which is what this
+    /// path always did — never to a wrong answer.
+    fn predicate_is_prunable(
+        &self,
+        predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        file_cfg: &FileReadConfig,
+    ) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::physical_expr::expressions::Column;
+
+        let mut prunable = true;
+        predicate
+            .apply(|expr| {
+                let Some(column) = expr.downcast_ref::<Column>() else {
+                    return Ok(TreeNodeRecursion::Continue);
+                };
+                // An index outside the physical schema cannot be resolved, so
+                // treat it as unsafe rather than assuming it is fine.
+                let Some(field) = self.physical_schema.fields().get(column.index()) else {
+                    prunable = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                };
+                let is_float = matches!(
+                    field.data_type(),
+                    DataType::Float16 | DataType::Float32 | DataType::Float64
+                );
+                if is_float || file_cfg.renamed_column_indices.contains(&column.index()) {
+                    prunable = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("scanning a predicate for column references cannot fail");
+        prunable
     }
 
     /// Configure this table for write operations.
@@ -2078,8 +2216,7 @@ impl DuckLakeTable {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
 
         // Deletes filter by physical row position, so this is a positional path:
-        // it must read the file in row-group-aligned, non-repartitionable,
-        // non-pruning partitions and synthesize positions before filtering.
+        // the scan must also read the reader-produced position column.
         let deleted_positions = self
             .deleted_positions_for_file(state, table_file, inlined_positions)
             .await?;
@@ -2101,37 +2238,31 @@ impl DuckLakeTable {
         };
 
         let exec_after_delete: Arc<dyn ExecutionPlan> = if let Some(positions) = deleted_positions {
-            // Positional path: no scan-level limit (would drop rows before the
-            // delete filter); DataFusion enforces LIMIT above the table plan.
-            let target_partitions = state.config().target_partitions();
-            let (file_groups, partition_starts) =
-                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+            // Positional path: read the physical position alongside the data so
+            // deletes are matched by position. No scan-level limit (it would drop
+            // rows before the delete filter); DataFusion enforces LIMIT above.
+            let (table_schema, pos_table_idx, _pos_name) =
+                positional_table_schema(file_cfg.read_schema.clone());
+            let mut proj = proj_indices.clone();
+            proj.push(pos_table_idx);
+            let pos_index = proj.len() - 1;
 
-            let source = PositionalFileSource::wrap(Arc::new(
-                self.create_parquet_source(file_cfg.read_schema.clone()),
-            ));
-            let num_file_groups = file_groups.len();
+            let pf = self.partitioned_data_file(
+                table_file,
+                file_cfg.embedded_rowid_parquet_name.is_some(),
+                file_statistics,
+            )?;
             let mut builder = self
-                .scan_config_builder(source)
-                .with_file_groups(file_groups)
-                // FileRowNumberExec seeds row positions from the scan
-                // partition index, so each partition must read exactly
-                // its configured row-group chunk. Declaring the output
-                // partitioning pins the file-group-to-partition mapping;
-                // otherwise DataFusion's shared work queue lets sibling
-                // partitions steal chunks.
-                .with_output_partitioning(Some(
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
-                ));
-            builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
+                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .with_file_group(FileGroup::new(vec![pf]));
+            builder = builder.with_projection_indices(Some(proj))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
-            let with_pos: Arc<dyn ExecutionPlan> =
-                Arc::new(FileRowNumberExec::new(scan, partition_starts));
             Arc::new(DeleteFilterExec::try_new(
-                with_pos,
+                scan,
                 table_file.file.path.clone(),
                 Arc::new(positions),
+                pos_index,
             )?)
         } else {
             // No actual deletes for this file: plain scan, scan-level limit OK.
@@ -2151,16 +2282,29 @@ impl DuckLakeTable {
         };
 
         // ColumnRenameExec presents the catalog schema and, on the positional
-        // path, drops the internal `__ducklake_row_pos` column (by name).
-        if !file_cfg.name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
-            Ok(Arc::new(ColumnRenameExec::new(
-                exec_after_delete,
-                output_schema,
-                file_cfg.name_mapping.clone(),
-            )))
-        } else {
-            Ok(exec_after_delete)
+        // path, drops the internal physical-position column.
+        let mut exec: Arc<dyn ExecutionPlan> =
+            if !file_cfg.name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
+                Arc::new(ColumnRenameExec::new(
+                    exec_after_delete,
+                    output_schema,
+                    file_cfg.name_mapping.clone(),
+                ))
+            } else {
+                exec_after_delete
+            };
+
+        // Both branches above can let a predicate reach the parquet reader's
+        // pruning, so both need the NaN barrier: footer float bounds exclude
+        // NaN, and pruning on them would silently drop NaN rows. The plain-scan
+        // branch (a file whose delete file resolves to no positions) has always
+        // been pushdown-capable and was missing this.
+        let nan_unsafe_columns =
+            self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
+        if !nan_unsafe_columns.is_empty() {
+            exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
         }
+        Ok(exec)
     }
 
     /// Inspect a single file's parquet metadata for the row-lineage scan
@@ -2217,14 +2361,27 @@ impl DuckLakeTable {
             layout.read_schema.clone()
         };
 
+        // A catalog column reads under a different physical name when the file
+        // renamed it or predates it. `layout.read_schema` is one field per
+        // current column in catalog order, so the comparison is positional.
+        let renamed_column_indices: HashSet<usize> = self
+            .physical_schema
+            .fields()
+            .iter()
+            .zip(layout.read_schema.fields())
+            .enumerate()
+            .filter(|(_, (catalog, physical))| catalog.name() != physical.name())
+            .map(|(index, _)| index)
+            .collect();
+
         let cfg = Arc::new(FileReadConfig {
             read_schema,
+            row_group_count: layout.row_group_count,
+            renamed_column_indices: Arc::new(renamed_column_indices),
             name_mapping,
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
             drops_current_columns: layout.drops_current_columns,
-            row_group_starts: layout.row_group_starts.clone(),
-            row_group_count: layout.row_group_count,
         });
 
         {
@@ -2235,96 +2392,16 @@ impl DuckLakeTable {
         Ok(cfg)
     }
 
-    /// Build row-group-aligned scan partitions for a single file on a
-    /// *positional* path (rowid synthesis and/or delete filtering).
-    ///
-    /// Returns one [`FileGroup`] per contiguous run of row groups (so each is a
-    /// distinct DataFusion partition) together with a `partition_starts` vector
-    /// whose `i`-th entry is the **true physical row position of the first row**
-    /// of `file_groups[i]`. The two vectors are 1:1; `FileRowNumberExec` uses
-    /// `partition_starts[partition]` to seed positions.
-    ///
-    /// Each chunk carries a whole-row-group `Scan`/`Skip` [`ParquetAccessPlan`]
-    /// (never a `RowSelection`), so within a partition the reader emits a
-    /// complete, contiguous, in-order run of physical rows. A single chunk
-    /// (`target_partitions == 1`, or a file with ≤1 row group) carries no access
-    /// plan and reads the whole file in order — identical to the legacy path.
-    fn build_row_group_partitions(
-        &self,
-        file: &DuckLakeFileData,
-        read_cfg: &FileReadConfig,
-        target_partitions: usize,
-    ) -> DataFusionResult<(Vec<FileGroup>, Vec<i64>)> {
-        let resolved_path = self.resolve_file_path(file)?;
-        let file_size = validated_file_size(file.file_size_bytes, &resolved_path)?;
-        let footer_hint = file
-            .footer_size
-            .filter(|&s| s > 0)
-            .and_then(|s| usize::try_from(s).ok());
-
-        let make_pf = |access: Option<ParquetAccessPlan>| {
-            let mut pf = PartitionedFile::new(&resolved_path, file_size);
-            if let Some(hint) = footer_hint {
-                pf = pf.with_metadata_size_hint(hint);
-            }
-            if let Some(plan) = access {
-                pf = pf.with_extension(plan);
-            }
-            pf
-        };
-
-        let n = read_cfg.row_group_count;
-        let k = target_partitions.max(1).min(n.max(1));
-
-        // Single partition: whole file, in order, no access plan. Covers
-        // target_partitions == 1 and files with 0 or 1 row groups.
-        if k <= 1 {
-            return Ok((vec![FileGroup::new(vec![make_pf(None)])], vec![0]));
-        }
-
-        // Split the n row groups into k contiguous chunks as evenly as possible
-        // (row groups are written near-uniform, so group-count balancing closely
-        // tracks row-count balancing). The first `rem` chunks get one extra group.
-        let base = n / k;
-        let rem = n % k;
-        let mut file_groups = Vec::with_capacity(k);
-        let mut partition_starts = Vec::with_capacity(k);
-        let mut a = 0usize;
-        for chunk in 0..k {
-            let len = base + usize::from(chunk < rem);
-            let b = a + len;
-            debug_assert!(b <= n && len > 0);
-
-            let row_groups: Vec<RowGroupAccess> = (0..n)
-                .map(|rg| {
-                    if rg >= a && rg < b {
-                        RowGroupAccess::Scan
-                    } else {
-                        RowGroupAccess::Skip
-                    }
-                })
-                .collect();
-
-            file_groups.push(FileGroup::new(vec![make_pf(Some(ParquetAccessPlan::new(
-                row_groups,
-            )))]));
-            partition_starts.push(read_cfg.row_group_starts[a]);
-            a = b;
-        }
-        debug_assert_eq!(a, n);
-
-        Ok((file_groups, partition_starts))
-    }
-
     /// Build a plan for a single file when the synthetic `rowid` column is in
     /// the projection. Always uses per-file scans because each file may have a
     /// different layout (embedded rowid vs. synthesized) and a distinct
     /// `row_id_start`.
     ///
     /// Order on the positional path (non-embedded, or any file with deletes):
-    ///   DataSourceExec → FileRowNumberExec → DeleteFilterExec(?) → RowIdExec(?)
-    ///   → ColumnRenameExec. Embedded-rowid files with no deletes keep a plain
-    ///   DataSourceExec → ColumnRenameExec (rowid read from the file).
+    ///   DataSourceExec → DeleteFilterExec(?) → RowIdExec(?) → ColumnRenameExec,
+    ///   with the position column produced by the scan itself. Embedded-rowid
+    ///   files with no deletes keep a plain DataSourceExec → ColumnRenameExec
+    ///   (rowid read from the file).
     #[allow(clippy::too_many_arguments, reason = "per-file row-lineage scan inputs stay explicit")]
     async fn build_exec_for_file_with_rowid(
         &self,
@@ -2383,46 +2460,40 @@ impl DuckLakeTable {
         };
 
         let after_deletes: Arc<dyn ExecutionPlan> = if needs_position {
-            // Positional path: row-group-aligned partitions + a non-repartition,
-            // non-pruning source, so each partition emits a complete, contiguous,
-            // in-order run of physical rows. No scan-level limit (it would drop
-            // rows before delete filtering); DataFusion enforces LIMIT above.
-            let target_partitions = state.config().target_partitions();
-            let (file_groups, partition_starts) =
-                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+            // Positional path: the reader produces the physical position, which
+            // feeds delete filtering and/or rowid synthesis. No scan-level limit
+            // (it would drop rows before delete filtering); DataFusion enforces
+            // LIMIT above.
+            let (table_schema, pos_table_idx, _pos_name) =
+                positional_table_schema(file_cfg.read_schema.clone());
+            let mut proj = parquet_projection;
+            proj.push(pos_table_idx);
+            let pos_index = proj.len() - 1;
 
-            let source = PositionalFileSource::wrap(Arc::new(
-                self.create_parquet_source(file_cfg.read_schema.clone()),
-            ));
-            let num_file_groups = file_groups.len();
+            let pf = self.partitioned_data_file(table_file, has_embedded, file_statistics)?;
             let mut builder = self
-                .scan_config_builder(source)
-                .with_file_groups(file_groups)
-                // FileRowNumberExec seeds row positions from the scan
-                // partition index, so each partition must read exactly
-                // its configured row-group chunk. Declaring the output
-                // partitioning pins the file-group-to-partition mapping;
-                // otherwise DataFusion's shared work queue lets sibling
-                // partitions steal chunks.
-                .with_output_partitioning(Some(
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
-                ));
-            builder = builder.with_projection_indices(Some(parquet_projection))?;
-            let scan = DataSourceExec::from_data_source(builder.build());
-
-            // Materialize the physical position, then (optionally) filter deletes
-            // by it, then (for non-embedded files) synthesize rowid from it.
+                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .with_file_group(FileGroup::new(vec![pf]));
+            builder = builder.with_projection_indices(Some(proj))?;
             let mut plan: Arc<dyn ExecutionPlan> =
-                Arc::new(FileRowNumberExec::new(scan, partition_starts));
+                DataSourceExec::from_data_source(builder.build());
+
+            // Filter deletes by position, then (for non-embedded files)
+            // synthesize rowid from it.
             if let Some(p) = deleted_positions {
                 plan = Arc::new(DeleteFilterExec::try_new(
                     plan,
                     table_file.file.path.clone(),
                     Arc::new(p),
+                    pos_index,
                 )?);
             }
             if !has_embedded {
-                plan = Arc::new(RowIdExec::try_new(plan, table_file.row_id_start)?);
+                plan = Arc::new(RowIdExec::try_new(
+                    plan,
+                    table_file.row_id_start,
+                    pos_index,
+                )?);
             }
             plan
         } else {
@@ -2457,15 +2528,15 @@ impl DuckLakeTable {
             } else {
                 after_deletes
             };
-        // The positional path already refuses all filter pushdown
-        // (PositionalFileSource); only the legacy plain scan lets predicates
-        // reach the parquet reader's pruning, so only it needs the NaN barrier.
-        if !needs_position {
-            let nan_unsafe_columns =
-                self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
-            if !nan_unsafe_columns.is_empty() {
-                exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
-            }
+        // Every branch here can now let a predicate reach the parquet reader's
+        // row-group/page/bloom pruning: the positional branch no longer blocks
+        // pushdown, and `DeleteFilterExec` / `RowIdExec` / `ColumnRenameExec`
+        // forward it. So the NaN barrier is unconditional — footer float bounds
+        // exclude NaN, and pruning on them would silently drop NaN rows.
+        let nan_unsafe_columns =
+            self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
+        if !nan_unsafe_columns.is_empty() {
+            exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
         }
         Ok(exec)
     }
@@ -2534,6 +2605,7 @@ impl DuckLakeTable {
         }
 
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+
         let snap_name = file_cfg
             .embedded_snapshot_parquet_name
             .clone()
@@ -2543,6 +2615,27 @@ impl DuckLakeTable {
                     table_file.file.path
                 ))
             })?;
+
+        // Same contract as every other rowid path, and as the C++ extension: a
+        // file with neither an embedded rowid nor a catalog `row_id_start` has no
+        // reconstructable lineage. Gated on the output actually carrying `rowid`,
+        // because this function serves two callers: the rowid-projected read and
+        // an ordinary time-travel read, which projects the embedded column away
+        // and needs no lineage at all. A merged partial file always carries the
+        // embedded column, so this is a guard against a foreign catalog rather
+        // than a live case — but without it the rowid caller's failure is a
+        // confusing "no field named rowid" from the rename layer instead of a
+        // statement of what is actually missing.
+        if output_schema.field_with_name(ROWID_COLUMN_NAME).is_ok()
+            && file_cfg.embedded_rowid_parquet_name.is_none()
+            && table_file.row_id_start.is_none()
+        {
+            return Err(DataFusionError::Execution(format!(
+                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
+                 `row_id_start` set in the catalog — row lineage cannot be reconstructed",
+                table_file.file.path
+            )));
+        }
 
         // Append the embedded snapshot-id column to the file's read schema so the
         // scan materializes it. It is deliberately absent from the cached
@@ -2574,30 +2667,34 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(projection))?;
             DataSourceExec::from_data_source(builder.build())
         } else {
-            let target_partitions = state.config().target_partitions();
-            let (file_groups, partition_starts) =
-                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
-            let source = PositionalFileSource::wrap(Arc::new(
-                self.create_parquet_source(read_schema.clone()),
-            ));
-            let num_file_groups = file_groups.len();
+            // Positional: the reader appends the physical row position, which the
+            // delete filter matches the delete set against.
+            let (table_schema, pos_table_idx, _pos_name) =
+                positional_table_schema(read_schema.clone());
+            let mut proj = projection;
+            proj.push(pos_table_idx);
+            let pos_index = proj.len() - 1;
             let builder = self
-                .scan_config_builder(source)
-                .with_file_groups(file_groups)
-                .with_output_partitioning(Some(
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
-                ))
-                .with_projection_indices(Some(projection))?;
+                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .with_file_group(FileGroup::new(vec![
+                    self.partitioned_file(&table_file.file)?,
+                ]))
+                .with_projection_indices(Some(proj))?;
             let scan = DataSourceExec::from_data_source(builder.build());
-            let with_positions: Arc<dyn ExecutionPlan> =
-                Arc::new(FileRowNumberExec::new(scan, partition_starts));
             Arc::new(DeleteFilterExec::try_new(
-                with_positions,
+                scan,
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
+                pos_index,
             )?)
         };
 
+        // No `NanPruningBarrierExec` here: `SnapshotFilterExec` does not implement
+        // `gather_filters_for_pushdown`, so DataFusion's default bars every parent
+        // filter and no predicate can reach the reader's float pruning. Give
+        // `SnapshotFilterExec` filter pushdown and this path needs the barrier —
+        // see `build_exec_for_file_with_deletes` for the shape.
+        //
         // Drop rows newer than the read snapshot, then present the catalog schema.
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(SnapshotFilterExec::try_new(
             scan,
@@ -2836,19 +2933,14 @@ impl DuckLakeTable {
             Arc::clone(&file_cfg.read_schema)
         };
 
-        // Positional scan: row-group-aligned partitions + a non-repartition,
-        // non-pruning source so `FileRowNumberExec` yields true physical
-        // positions. Project the physical columns (logical order) and, for an
-        // embedded file, the embedded rowid column too.
+        // Positional scan: the reader produces the physical position. Project the
+        // physical columns (logical order), then for an embedded file the
+        // embedded rowid column, then the position column.
         let physical_len = self.physical_schema.fields().len();
-        let target_partitions = state.config().target_partitions();
-        let (file_groups, partition_starts) =
-            self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
-        let source =
-            PositionalFileSource::wrap(Arc::new(self.create_parquet_source(read_schema.clone())));
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema(read_schema.clone());
         // Built by pushing, so each appended column records the index it actually
-        // landed at. Arithmetic off `physical_len` would silently misalign the two
-        // appended columns for a file that has one but not the other, and both are
+        // landed at. Arithmetic off `physical_len` would silently misalign the
+        // appended columns for a file that has one but not another, and all are
         // Int64 — nothing downstream would fail to downcast.
         let mut proj: Vec<usize> = (0..physical_len).collect();
         let embedded_batch_idx = has_embedded.then(|| {
@@ -2859,26 +2951,29 @@ impl DuckLakeTable {
             proj.push(read_schema.fields().len() - 1);
             proj.len() - 1
         });
-        let num_file_groups = file_groups.len();
-        let scan = DataSourceExec::from_data_source(
-            self.scan_config_builder(source)
-                .with_file_groups(file_groups)
-                .with_output_partitioning(Some(
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
-                ))
+        proj.push(pos_table_idx);
+        let pos_index = proj.len() - 1;
+
+        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            self.scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .with_file_group(FileGroup::new(vec![
+                    self.partitioned_file(&table_file.file)?,
+                ]))
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let mut plan: Arc<dyn ExecutionPlan> =
-            Arc::new(FileRowNumberExec::new(scan, partition_starts));
+        let mut plan = self.split_across_partitions(scan, state, &file_cfg)?;
+        // Mask with BOTH delete sources (#262): inlined positions and prior
+        // Parquet ones. Only `existing_parquet_deleted` is carried forward into
+        // the replacement delete file.
         if !deleted_positions.is_empty() {
             plan = Arc::new(DeleteFilterExec::try_new(
                 plan,
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
+                pos_index,
             )?);
         }
-        let pos_index = plan.schema().index_of(ROW_POS_COLUMN_NAME)?;
 
         Ok(UpdateSourceScan {
             scan: plan,
@@ -3041,7 +3136,7 @@ pub(crate) fn rewrite_scanned_batch(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| {
-            DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+            DataFusionError::Internal("physical-position column is not Int64".to_string())
         })?;
 
     // Predicate mask (all rows when there is no WHERE). A NULL predicate
@@ -4478,6 +4573,79 @@ mod tests {
 
     /// The physical expression a caller would build for a scan, and hand to both
     /// `files_matching` and `resolve_positions`.
+    /// `predicate_is_prunable` must distinguish a REAL physical rename from the
+    /// synthetic `_ducklake_internal_row_id -> rowid` entry that every file
+    /// written by `UPDATE` or compaction carries.
+    ///
+    /// This is asserted here rather than end-to-end because the guard is read
+    /// only inside `resolve_positions`, whose plan is built and executed by
+    /// `DuckLakeDeleteExec` and never surfaces in `EXPLAIN ANALYZE`. An
+    /// integration test can observe that a `DELETE` is correct, but not that it
+    /// pruned.
+    #[test]
+    fn predicate_is_prunable_ignores_the_synthetic_rowid_rename() -> Result<()> {
+        let table = DuckLakeTable::new(
+            1,
+            "events",
+            Arc::new(LazyMillionFileProvider::default()),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )?;
+        let predicate = physical_predicate(&table, col("id").eq(lit(5_i64)));
+
+        let cfg = |renamed: Vec<usize>, mapping: Vec<(&str, &str)>| FileReadConfig {
+            read_schema: table.physical_schema.clone(),
+            name_mapping: mapping
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            row_group_count: 4,
+            renamed_column_indices: Arc::new(renamed.into_iter().collect()),
+            embedded_rowid_parquet_name: None,
+            embedded_snapshot_parquet_name: None,
+            drops_current_columns: false,
+        };
+        let id_index = table.physical_schema.index_of("id").unwrap();
+
+        // A file written by UPDATE / compaction: one mapping entry, but no data
+        // column is renamed. Must still prune.
+        assert!(
+            table.predicate_is_prunable(
+                &predicate,
+                &cfg(
+                    vec![],
+                    vec![(
+                        crate::row_id::EMBEDDED_ROW_ID_COLUMN_NAME,
+                        ROWID_COLUMN_NAME
+                    )]
+                )
+            ),
+            "the synthetic rowid rename must not disable pruning"
+        );
+
+        // The predicate's own column reads under a different physical name, so
+        // it cannot bind in the reader and must not be pushed.
+        assert!(
+            !table.predicate_is_prunable(&predicate, &cfg(vec![id_index], vec![])),
+            "a predicate on a renamed column must disable pruning"
+        );
+
+        // A DIFFERENT column is renamed or absent — the shape a file older than
+        // an `ADD COLUMN` has. The predicate never references it, so pruning
+        // stands. (This fixture's table has one column, so the unrelated index
+        // is synthetic; what matters is that it is not the one the predicate
+        // references.)
+        assert!(
+            table.predicate_is_prunable(&predicate, &cfg(vec![id_index + 1], vec![])),
+            "an unrelated renamed/absent column must not disable pruning"
+        );
+
+        // Nothing renamed: prunable.
+        assert!(table.predicate_is_prunable(&predicate, &cfg(vec![], vec![])));
+        Ok(())
+    }
+
     fn physical_predicate(table: &DuckLakeTable, expr: Expr) -> Arc<dyn PhysicalExpr> {
         let df_schema = DFSchema::try_from(table.physical_schema.as_ref().clone()).unwrap();
         SessionContext::new()
@@ -5015,18 +5183,24 @@ mod tests {
                 true,
             );
 
-            // min is a valid lower bound regardless of NaN state — NaN sorts
-            // above every value, so it can never undercut the recorded min.
+            // Neither bound survives an unknown/positive NaN state: DataFusion
+            // orders floats with `total_cmp`, under which negative NaN sits
+            // below every value (below -Infinity included), so a recorded min is
+            // no more trustworthy than a recorded max. `contains_nan` does not
+            // record the sign, so both must go.
             let per_file = &file_stats[&7].column_statistics[0];
             let table_col = &table_stats.column_statistics[0];
+            let expected_min = if contains_nan == Some(false) {
+                Precision::Exact(ScalarValue::Float64(Some(1.0)))
+            } else {
+                Precision::Absent
+            };
             assert_eq!(
-                per_file.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                per_file.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
             assert_eq!(
-                table_col.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                table_col.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
 
@@ -5076,9 +5250,16 @@ mod tests {
             );
 
             let column = &statistics.column_statistics[0];
+            // Both bounds are gated: negative NaN sits below a recorded min just
+            // as positive NaN sits above a recorded max, and `contains_nan`
+            // does not record the sign.
+            let expected_min = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(1.0)))
+            } else {
+                Precision::Absent
+            };
             assert_eq!(
-                column.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                column.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
             let expected_max = if max_usable {
@@ -5144,13 +5325,12 @@ mod tests {
             Precision::Exact(ScalarValue::Float64(Some(3.0)))
         );
 
-        // One file NaN-unknown: its max is untrusted, so the aggregate max
-        // degrades to unknown; the min still folds from both files.
+        // One file NaN-unknown: NEITHER of its bounds is trusted, so both
+        // aggregates degrade to unknown. A negative NaN in that file would sit
+        // below the folded min exactly as a positive one would sit above the
+        // folded max.
         let statistics = build(None);
-        assert_eq!(
-            statistics.column_statistics[0].min_value,
-            Precision::Exact(ScalarValue::Float64(Some(0.5)))
-        );
+        assert_eq!(statistics.column_statistics[0].min_value, Precision::Absent);
         assert_eq!(statistics.column_statistics[0].max_value, Precision::Absent);
         Ok(())
     }

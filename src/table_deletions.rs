@@ -14,11 +14,11 @@
 //! internal and executed directly — the delete files are fully collected (the
 //! position set must be complete before any data row can be classified), then
 //! the data file is streamed batch-by-batch through the filter. Deleted rows
-//! are matched by TRUE physical file position (`PositionalFileSource` +
-//! [`FileRowNumberExec`]) rather than stream arrival order. Exposing the scans
-//! as children lets the optimizer repartition them (round-robin or byte-range
-//! splits), which desynchronizes the delete-position set from the data rows —
-//! deletions were silently missed or mis-attributed (issue #178).
+//! are matched by TRUE physical file position — the column the parquet reader
+//! produces — rather than stream arrival order. Exposing the scans as children
+//! lets the optimizer repartition them (round-robin or byte-range splits),
+//! which desynchronizes the delete-position set from the data rows — deletions
+//! were silently missed or mis-attributed (issue #178).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -45,15 +45,14 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, collect,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties, collect,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::positional_source::PositionalFileSource;
-use crate::row_id::{FileRowNumberExec, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
     validated_record_count,
@@ -309,6 +308,18 @@ impl TableDeletionsTable {
             &layout,
             &embedded_name,
         )?;
+        #[cfg(debug_assertions)]
+        {
+            let schema = data_file_exec.schema();
+            let field = schema.fields().get(pos_col_idx).unwrap_or_else(|| {
+                panic!(
+                    "pos_col_idx {pos_col_idx} is out of range for a scan of {} columns",
+                    schema.fields().len()
+                )
+            });
+            crate::row_id::validate_row_pos_field("correlate_deletions", pos_col_idx, field)
+                .expect("`pos_col_idx` arithmetic must land on the position column");
+        }
 
         // Validate record_count before use — a negative value from corrupt metadata
         // would cause incorrect behavior (e.g., empty ranges in full-file deletes).
@@ -397,13 +408,19 @@ impl TableDeletionsTable {
     }
 
     /// Positional scan of the source data file: table columns, the embedded
-    /// rowid column when `embedded_name` is `Some`, and the internal
-    /// physical-position column ([`ROW_POS_COLUMN_NAME`]). [`PositionalFileSource`]
-    /// and [`FileRowNumberExec`] guarantee true physical positions, so deleted
-    /// rows are matched to the delete file's `pos` set regardless of how the
-    /// file is read (issue #178).
-    /// The table columns are read under the physical names THIS file gives them
-    /// and presented back under the catalog schema, above [`FileRowNumberExec`] so
+    /// rowid column when `embedded_name` is `Some`, and the reader-produced
+    /// physical-position column ([`ROW_POS_COLUMN_NAME`]) appended last.
+    ///
+    /// Positions come from the parquet reader, so deleted rows are matched to
+    /// the delete file's `pos` set regardless of how the file is read — pruned,
+    /// filtered, split or reordered (issue #178).
+    ///
+    /// The scan takes no explicit projection, so it reads every column of the
+    /// table schema in order: `[table columns, embedded rowid?, position]`. That
+    /// puts the position column at `table_len + embedded`, which is exactly what
+    /// `pos_col_idx` in `correlate_deletions` computes; see the debug assertion
+    /// there. The table columns are read under the physical names THIS file
+    /// gives them and presented back under the catalog schema, above the scan so
     /// the position column passes through.
     fn build_data_file_scan(
         &self,
@@ -430,19 +447,22 @@ impl TableDeletionsTable {
             None => Arc::clone(&layout.read_schema),
         };
 
-        let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
-        let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-            .with_file_group(FileGroup::new(vec![pf]))
-            // One file group == one output partition, so the scan is neither
-            // repartitioned nor work-stolen and `FileRowNumberExec` sees true
-            // physical positions.
-            .with_output_partitioning(Some(
-                datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-            ));
+        // The scan is re-presented under the catalog names below, and
+        // `ColumnRenameExec` binds by name, so the position column's name must
+        // clear those too — not only the file's physical ones.
+        let (table_schema, _, _) = positional_table_schema_reserving(
+            read_schema,
+            self.table_schema.fields().iter().map(|f| f.name().as_str()),
+        );
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(ParquetSource::new(table_schema)),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
         let table_fields: Vec<FieldRef> = self.table_schema.fields().iter().cloned().collect();
         Ok(present_catalog_schema(
-            Arc::new(FileRowNumberExec::new(scan, vec![0])),
+            scan,
             &table_fields,
             &layout.name_mapping,
         ))
@@ -743,8 +763,21 @@ async fn deleted_rows_stream(
     }
 
     // 3. Stream the data file and keep the rows whose PHYSICAL position is in
-    //    the deleted set. The positional scan is a single partition covering
-    //    the whole file, so no row can end up out of reach of the position set.
+    //    the deleted set.
+    //
+    //    Only partition 0 is executed, so the scan MUST have exactly one: this
+    //    exec has no DataFusion children (see the module docs), so nothing
+    //    repartitions it, and it is built from a single `FileGroup`. If that
+    //    ever stops holding, every row in the other partitions would be
+    //    silently dropped — a deletion feed that quietly omits deletions — so
+    //    refuse rather than under-report.
+    let partitions = unit.data_file_scan.output_partitioning().partition_count();
+    if partitions != 1 {
+        return Err(DataFusionError::Internal(format!(
+            "deletions data-file scan must be a single partition covering the whole \
+             file, found {partitions}"
+        )));
+    }
     let data_stream = unit.data_file_scan.execute(0, context)?;
     Ok(data_stream
         .try_filter_map(move |batch| {
@@ -828,9 +861,9 @@ fn filter_batch(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "physical-position column {ROW_POS_COLUMN_NAME} is missing or not Int64"
-            ))
+            DataFusionError::Internal(
+                "physical-position column is missing or not Int64".to_string(),
+            )
         })?;
 
     // Resolve each deleted row's rowid: the embedded rowid column when the
