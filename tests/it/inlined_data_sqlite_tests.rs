@@ -33,6 +33,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Row};
 use tempfile::TempDir;
 
+use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
 use datafusion_ducklake::{
     ColumnDef, DeleteFileEntry, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter,
     DuckLakeWriteOptions, InlinedRowRef, MetadataProvider, MetadataWriter, SnapshotCommitMetadata,
@@ -283,6 +284,72 @@ async fn seed_inlined(
         .await
         .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_inlined_scan_pushes_supported_filters_and_falls_back_per_table() {
+    let temp = TempDir::new().unwrap();
+    let writer = make_writer(&temp).await;
+    create_empty_table(&writer, "t");
+    let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_name = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let snapshot_id: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    seed_inlined(
+        &pool,
+        table_id,
+        &[(0, snapshot_id, None, 1, 10), (1, snapshot_id, None, 2, 20)],
+    )
+    .await;
+    let provider = SqliteMetadataProvider::new(&rw_url(&temp)).await.unwrap();
+    let columns = provider.get_table_structure(table_id, snapshot_id).unwrap();
+    let pushed = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(pushed.materialized_row_count, 1);
+
+    let range = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(range.materialized_row_count, 1);
+
+    let fallback = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "missing".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::I64(2),
+            }),
+        )
+        .unwrap();
+    assert_eq!(fallback.materialized_row_count, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1048,6 +1115,23 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
         .get_table_by_name(catalog_schema.schema_id, "uint64_values", snapshot)
         .unwrap()
         .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, snapshot)
+        .unwrap();
+    let filtered = provider
+        .scan_inlined_data(
+            table.table_id,
+            snapshot,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "value".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::U64(i64::MAX as u64 + 1),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 2);
+
     let pool = SqlitePool::connect(&format!(
         "sqlite:{}?mode=rwc",
         temp.path().join("test.db").display()
@@ -1170,7 +1254,7 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sqlite_uint64_reads_mixed_legacy_and_padded_tables() {
+async fn sqlite_uint64_filter_handles_mixed_legacy_and_padded_tables() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&temp).await);
     let batch = RecordBatch::try_new(
@@ -1239,10 +1323,21 @@ async fn sqlite_uint64_reads_mixed_legacy_and_padded_tables() {
     let columns = provider
         .get_table_structure(result.table_id, snapshot)
         .unwrap();
-    let batches = provider
-        .get_inlined_data(result.table_id, snapshot, &columns)
+    let filtered = provider
+        .scan_inlined_data(
+            result.table_id,
+            snapshot,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "value".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::U64(i64::MAX as u64 + 1),
+            }),
+        )
         .unwrap();
-    let mut actual = batches
+    assert_eq!(filtered.materialized_row_count, 2);
+    let mut actual = filtered
+        .batches
         .iter()
         .flat_map(|batch| {
             batch
@@ -1257,7 +1352,32 @@ async fn sqlite_uint64_reads_mixed_legacy_and_padded_tables() {
         })
         .collect::<Vec<_>>();
     actual.sort_unstable();
-    assert_eq!(actual, vec![0, 7, 42, i64::MAX as u64 + 1, u64::MAX]);
+    assert_eq!(actual, vec![i64::MAX as u64 + 1, u64::MAX]);
+
+    for (needle, expected) in [(0_u64, 0_u64), (42, 42), (7, 7)] {
+        let filtered = provider
+            .scan_inlined_data(
+                result.table_id,
+                snapshot,
+                &columns,
+                Some(&InlinedFilter::Comparison {
+                    column: "value".to_string(),
+                    op: InlinedComparison::Eq,
+                    value: InlinedValue::U64(needle),
+                }),
+            )
+            .unwrap();
+        assert_eq!(filtered.materialized_row_count, 1, "equality on {needle}");
+        assert_eq!(
+            filtered.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            expected
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1458,6 +1578,72 @@ async fn sqlite_declared_indexes_apply_when_inline_table_is_created_later() {
     .await
     .unwrap();
     assert_eq!(indexes, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_stale_index_declaration_does_not_block_inlined_commits() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]));
+    let batch = |value: u64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![value]))],
+        )
+        .unwrap()
+    };
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(1);
+    let created = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&options)
+        .write_table("main", "stale_declaration", &[batch(1)])
+        .await
+        .unwrap();
+
+    // A declaration naming a column that a later schema migration removed:
+    // written directly because the setter validates against live columns.
+    let pool = SqlitePool::connect(&format!(
+        "sqlite:{}?mode=rwc",
+        temp.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+         VALUES ('inlined_index_columns', 'ghost_column,value', 'table', ?)",
+    )
+    .bind(created.table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&options)
+        .append_table("main", "stale_declaration", &[batch(2)])
+        .await
+        .unwrap();
+    writer.ensure_inlined_indexes(created.table_id).unwrap();
+
+    let physical: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(created.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? ORDER BY name",
+    )
+    .bind(&physical)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexes, vec![format!("{physical}_value_idx")]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2080,6 +2266,67 @@ async fn row_lineage_scan_refuses_tables_with_inlined_rows() {
         .unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_lineage_scan_refuses_only_when_pushed_filters_keep_inlined_rows() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options);
+    table_writer
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    // Twelve rows exceed the inlining limit and land in Parquet.
+    let ids = (100..112).collect::<Vec<_>>();
+    let vals = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+    table_writer
+        .append_table("main", "t", &[batch(ids, vals)])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider)
+        .unwrap()
+        .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    // The pushed filter excludes every inlined row, so the Parquet-only
+    // rowid plan loses nothing and the scan succeeds.
+    let batches = ctx
+        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 100")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows = batches
+        .iter()
+        .flat_map(|b| {
+            let rowids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ids = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..b.num_rows()).map(move |i| (rowids.value(i), ids.value(i)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, vec![(2, 100)]);
+
+    // An inlined row still matches, so the scan keeps refusing.
+    let error = match ctx
+        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 2")
+        .await
+    {
+        Ok(df) => df.collect().await.expect_err("rowid scan must refuse"),
+        Err(e) => e,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("row-lineage (rowid) scan on a table with inlined rows is not supported"),
+        "{message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
