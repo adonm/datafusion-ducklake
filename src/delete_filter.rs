@@ -18,13 +18,16 @@ use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
@@ -80,6 +83,39 @@ impl DeleteFilterExec {
     }
 }
 
+impl DeleteFilterExec {
+    /// How many of `deleted_positions` name a row of THIS file.
+    ///
+    /// NOT `deleted_positions.len()`. Execution drops a row only when that row's
+    /// own position is in the set, so a position outside `0..rows` names no row
+    /// here and removes nothing. Subtracting it would publish a count below what
+    /// the scan returns, and `count(*)` is answered from that number, so the
+    /// query would be wrong rather than slow.
+    ///
+    /// Such a position arises with no corruption at all: a delete file's
+    /// `file_path` column is documentation this reader ignores, so one delete
+    /// file referenced by several data files contributes the others' positions.
+    /// With a truthful `record_count` the file holds exactly `rows` rows, every
+    /// such position belongs to a different file, and `rows - in_range` is
+    /// exactly what the scan emits.
+    ///
+    /// With a CORRUPT `record_count`, `rows` is itself wrong and the published
+    /// count disagrees with the scan in whichever direction the corruption runs.
+    /// That is a deliberate trade, and upstream's: the alternative — clamping the
+    /// scan to the recorded count — makes the numbers agree by dropping rows,
+    /// and this filter also feeds the UPDATE source scan, where a dropped row is
+    /// rewritten out of existence rather than hidden.
+    ///
+    /// The subtraction at the call site needs no `checked_sub`: this counts only
+    /// positions strictly below `rows`, from a set, so it can never exceed them.
+    fn deleted_in_range(&self, rows: usize) -> usize {
+        self.deleted_positions
+            .iter()
+            .filter(|position| usize::try_from(**position).is_ok_and(|p| p < rows))
+            .count()
+    }
+}
+
 impl DisplayAs for DeleteFilterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -114,6 +150,76 @@ impl ExecutionPlan for DeleteFilterExec {
     /// Order-preserving: drops rows but never reorders them.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
+    }
+
+    /// The input's row count less the rows this node removes, so an unfiltered
+    /// `count(*)` over a table with deletes is still answered from the catalog
+    /// rather than by reading every file — which is what official does, folding
+    /// `count(*)` unconditionally and subtracting delete counts independently.
+    ///
+    /// `deleted_positions` is the authority, not the catalog's `delete_count`.
+    /// It is a SET, assembled by merging a file's positional deletes with its
+    /// inlined ones, so a row deleted by both is counted once — and it covers
+    /// inlined deletes, which leave `delete_file` and `delete_count` NULL and are
+    /// therefore invisible to the catalog counters.
+    ///
+    /// PRECONDITION: every position names a row this file holds. Subtracting the
+    /// set's size is only right under that invariant — execution drops a row by
+    /// set MEMBERSHIP, so an unmatched position removes nothing at runtime while
+    /// still counting here, and `count(*)` would answer below what the scan
+    /// emits. `DuckLakeTable::deleted_positions_for_file` establishes it by
+    /// dropping positions outside the file's `record_count`, which matters
+    /// because a delete file's `file_path` column is ignored and one such file
+    /// may be referenced by several data files.
+    ///
+    /// Column bounds are dropped to unknown. Removing rows can remove the very
+    /// row holding an extreme, and nothing here knows which, so an inherited
+    /// bound could answer `max(col)` with a value that is no longer present. The
+    /// row count survives because it needs no such knowledge: every deleted
+    /// position is one fewer row, whichever row it was.
+    ///
+    /// Implemented on `statistics_from_inputs` rather than the deprecated
+    /// `partition_statistics`: that is the method the `StatisticsContext` walk
+    /// actually calls, and a child reached by calling `partition_statistics`
+    /// directly would answer from the trait default (unknown) whenever it, too,
+    /// only implements the new one. Unlike `NanPruningBarrierExec`, no deprecated
+    /// override is kept alongside — an out-of-tree caller on the old method gets
+    /// `new_unknown` here, which loses the fold but cannot produce a wrong
+    /// answer, whereas the barrier's override exists to keep a *safety* property
+    /// for those callers.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let Some(input) = input_stats.first() else {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        };
+        let mut statistics = input.as_ref().clone();
+        // Deleted positions belong to the FILE, not to any one output partition,
+        // so they cannot be attributed to a single partition's count.
+        statistics.num_rows = if args.partition().is_some() {
+            statistics.num_rows.to_inexact()
+        } else {
+            match statistics.num_rows {
+                Precision::Exact(rows) => Precision::Exact(rows - self.deleted_in_range(rows)),
+                other => other.to_inexact(),
+            }
+        };
+        // The input's byte size counts rows this node drops, and nothing here
+        // knows their width, so it can only be an over-estimate from here on —
+        // never an exact figure.
+        statistics.total_byte_size = statistics.total_byte_size.to_inexact();
+        statistics.column_statistics = statistics
+            .column_statistics
+            .iter()
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+        Ok(Arc::new(statistics))
     }
 
     /// Forward filter pushdown unchanged: this node's output schema is its input
@@ -203,7 +309,17 @@ impl DeleteFilterStream {
         let num_rows = batch.num_rows();
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            if !self.deleted_positions.contains(&pos.value(i)) {
+            let position = pos.value(i);
+            // No clamp against the file's `record_count`. A short count is
+            // corrupt metadata, and dropping the rows past it would be
+            // destructive rather than merely wrong: this filter also feeds the
+            // UPDATE source scan, whose surviving rows are rewritten into a new
+            // file, so a dropped row would be erased from the catalog and could
+            // not be recovered by repairing the count. Official does not clamp
+            // either — its `SetMaxRowCount` path is unreachable, because
+            // `DuckLakeFileListEntry::max_row_count` is never assigned — and it
+            // likewise lets `count(*)` disagree with its own scan on such a file.
+            if !self.deleted_positions.contains(&position) {
                 keep_indices.push(i as u32);
             }
         }
