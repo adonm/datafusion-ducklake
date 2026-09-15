@@ -6348,7 +6348,9 @@ async fn expire_in_catalog_drops_absolute_reference_rows_without_scheduling() {
             "t",
             &cols(),
             &a1.column_ids,
-            &DataFileInfo::new(f1_abs.clone(), 100, 5).with_absolute_path(),
+            &DataFileInfo::new(f1_abs.clone(), 100, 5)
+                .with_absolute_path()
+                .with_owner_catalog(cat_a),
             WriteMode::Replace,
         )
         .unwrap();
@@ -6358,7 +6360,9 @@ async fn expire_in_catalog_drops_absolute_reference_rows_without_scheduling() {
             "t",
             &cols(),
             &a1.column_ids,
-            &DataFileInfo::new(f2_abs.clone(), 100, 5).with_absolute_path(),
+            &DataFileInfo::new(f2_abs.clone(), 100, 5)
+                .with_absolute_path()
+                .with_owner_catalog(cat_a),
             WriteMode::Replace,
         )
         .unwrap();
@@ -6482,7 +6486,9 @@ async fn cleanup_in_catalog_keeps_a_file_an_absolute_reference_still_names() {
         "t",
         &cols(),
         &a1.column_ids,
-        &DataFileInfo::new(f1_abs.clone(), 2, 5).with_absolute_path(),
+        &DataFileInfo::new(f1_abs.clone(), 2, 5)
+            .with_absolute_path()
+            .with_owner_catalog(cat_a),
         WriteMode::Replace,
     )
     .unwrap();
@@ -6636,8 +6642,14 @@ async fn cleanup_in_catalog_honours_absolute_delete_file_references() {
         "t",
         &cols(),
         &a1.column_ids,
-        &DataFileInfo::new(f2_abs, 2, 5).with_absolute_path(),
-        Some(&DeleteFileInfo::new(f1_abs.clone(), 2, 1).with_absolute_path()),
+        &DataFileInfo::new(f2_abs, 2, 5)
+            .with_absolute_path()
+            .with_owner_catalog(cat_a),
+        Some(
+            &DeleteFileInfo::new(f1_abs.clone(), 2, 1)
+                .with_absolute_path()
+                .with_owner_catalog(cat_a),
+        ),
         WriteMode::Replace,
     )
     .unwrap();
@@ -6689,10 +6701,12 @@ async fn register_existing_data_file_with_delete_attaches_an_absolute_reference_
             &ids,
             &DataFileInfo::new("/data/cat_9/public/orders/f1.parquet", 1024, 3)
                 .with_absolute_path()
+                .with_owner_catalog(9)
                 .with_footer_size(77),
             Some(
                 &DeleteFileInfo::new("/data/cat_9/public/orders/d1.parquet", 64, 1)
                     .with_absolute_path()
+                    .with_owner_catalog(9)
                     .with_footer_size(33),
             ),
             WriteMode::Replace,
@@ -6744,7 +6758,9 @@ async fn register_existing_data_file_with_delete_attaches_an_absolute_reference_
             "orders",
             &cols(),
             &ids,
-            &DataFileInfo::new("/data/cat_9/public/orders/f2.parquet", 512, 2).with_absolute_path(),
+            &DataFileInfo::new("/data/cat_9/public/orders/f2.parquet", 512, 2)
+                .with_absolute_path()
+                .with_owner_catalog(9),
             WriteMode::Append,
         )
         .unwrap();
@@ -6758,31 +6774,48 @@ async fn register_existing_data_file_with_delete_attaches_an_absolute_reference_
     assert_eq!(delete_rows, 1);
 }
 
-/// The partial indexes behind `referenced_absolute_paths` are part of the
-/// schema bootstrap, so an existing deployment gains them on its next boot.
+/// The partial indexes behind `all_reference_paths` are part of the schema
+/// bootstrap, so an existing deployment gains them on its next boot — and the
+/// predecessors they replace, which indexed path relativity, are dropped.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn initialize_multicatalog_schema_creates_absolute_path_indexes() {
+async fn initialize_multicatalog_schema_creates_reference_indexes() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
-    let names = ["idx_data_file_absolute_path", "idx_delete_file_absolute_path"];
-    let defs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT indexname::text, indexdef::text FROM pg_indexes
-         WHERE indexname = ANY($1) ORDER BY indexname",
-    )
-    .bind(&names[..])
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let names = ["idx_data_file_owner_catalog", "idx_delete_file_owner_catalog"];
+    let index_defs = |names: Vec<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT indexname::text, indexdef::text FROM pg_indexes
+                 WHERE indexname = ANY($1) ORDER BY indexname",
+            )
+            .bind(&names[..])
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let defs = index_defs(names.to_vec()).await;
     assert_eq!(
         defs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         names.to_vec()
     );
     for (name, def) in &defs {
         assert!(
-            def.contains("WHERE (NOT path_is_relative)"),
-            "{name} must be partial over absolute rows: {def}"
+            def.contains("WHERE (owner_catalog_id IS NOT NULL)"),
+            "{name} must be partial over reference rows: {def}"
         );
     }
+    assert!(
+        index_defs(vec![
+            "idx_data_file_absolute_path",
+            "idx_delete_file_absolute_path"
+        ])
+        .await
+        .is_empty(),
+        "the relativity-keyed indexes are dropped, not left answering a question \
+         nothing asks"
+    );
     // Idempotent: a second bootstrap is a no-op, not a duplicate-index error.
     initialize_multicatalog_schema(&pool).await.unwrap();
 }
@@ -6790,6 +6823,9 @@ async fn initialize_multicatalog_schema_creates_absolute_path_indexes() {
 /// The fail-closed ownership guard: a scheduled ABSOLUTE row naming an object outside
 /// the cleaning catalog's own `cat_{id}/` layout is never deleted, however unreferenced
 /// it looks.
+///
+/// Such a row carries no `owner_catalog_id`, which is what marks it as predating the
+/// ownership rule and so unverifiable.
 ///
 /// This is the mixed-version case. A build without the ownership rule scheduled every
 /// dead row including references, so a fork's catalog can hold a scheduled row naming
@@ -6911,7 +6947,9 @@ async fn reclaiming_a_file_keeps_a_deferred_row_that_shares_its_id() {
         "t",
         &cols(),
         &ids,
-        &DataFileInfo::new(shared_abs.clone(), 6, 1).with_absolute_path(),
+        &DataFileInfo::new(shared_abs.clone(), 6, 1)
+            .with_absolute_path()
+            .with_owner_catalog(cat_a),
         WriteMode::Replace,
     )
     .unwrap();
@@ -6921,8 +6959,9 @@ async fn reclaiming_a_file_keeps_a_deferred_row_that_shares_its_id() {
     for (path, rel) in [(shared_abs.as_str(), false), (solo_rel.as_str(), true)] {
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
-                 (catalog_id, data_file_id, path, path_is_relative, schedule_start)
-             VALUES ($1, 7, $2, $3, NOW())",
+                 (catalog_id, data_file_id, path, path_is_relative, schedule_start,
+                  scheduled_by_owner)
+             VALUES ($1, 7, $2, $3, NOW(), TRUE)",
         )
         .bind(cat_a)
         .bind(path)
@@ -7049,7 +7088,9 @@ async fn cleanup_honours_a_reference_spelled_differently_from_the_scheduled_row(
         "t",
         &cols(),
         &a1.column_ids,
-        &DataFileInfo::new(odd, 2, 5).with_absolute_path(),
+        &DataFileInfo::new(odd, 2, 5)
+            .with_absolute_path()
+            .with_owner_catalog(cat_a),
         WriteMode::Replace,
     )
     .unwrap();
@@ -7123,7 +7164,9 @@ async fn orphan_sweep_honours_a_reference_from_a_catalog_on_a_sibling_data_path(
         "t",
         &cols(),
         &[1_i64, 2_i64],
-        &DataFileInfo::new(shared, 6, 1).with_absolute_path(),
+        &DataFileInfo::new(shared, 6, 1)
+            .with_absolute_path()
+            .with_owner_catalog(cat_a),
         WriteMode::Replace,
     )
     .unwrap();
@@ -7150,4 +7193,556 @@ async fn orphan_sweep_honours_a_reference_from_a_catalog_on_a_sibling_data_path(
         "a reference from a sibling root still protects the object"
     );
     assert!(!a_dir.join("stray.parquet").exists(), "the orphan is gone");
+}
+
+/// A catalog's OWN file written outside `data_path` — what `begin_write_to_path`
+/// produces — is reclaimed by expire + cleanup.
+///
+/// Such a row is spelled absolutely, which is the same flag a cross-catalog
+/// reference carries, so an ownership rule that reads relativity classifies the
+/// file as someone else's: expire drops the row without scheduling the object,
+/// cleanup therefore never sees it, and the orphan sweep cannot reach it either
+/// because it lists only under `data_path`. The object leaks with nothing left in
+/// the catalog naming it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_reclaims_an_owned_absolute_file_written_outside_data_path() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+        delete_orphaned_files_multicatalog,
+    };
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+
+    // `outside` is a sibling of `data`, so nothing under it is ever listed by a
+    // sweep of the catalog's data path.
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    writer.set_data_path(&data_str).unwrap();
+
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec![Some("x")]))],
+    )
+    .unwrap();
+
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store)).unwrap();
+
+    // Generation 1 lands outside data_path, under a caller-chosen name.
+    let mut session = table_writer
+        .begin_write_to_path(
+            "public",
+            "t",
+            &arrow_schema,
+            outside.to_str().unwrap(),
+            "own.parquet".to_string(),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    let first = session.finish().await.unwrap();
+    let own_file = outside.join("own.parquet");
+    assert!(
+        own_file.exists(),
+        "generation 1 was written outside data_path"
+    );
+
+    // The row is this catalog's own, spelled absolutely.
+    let (path, is_relative): (String, bool) = sqlx::query_as(
+        "SELECT path, path_is_relative FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !is_relative,
+        "begin_write_to_path registers an absolute path"
+    );
+    assert_eq!(path, own_file.to_str().unwrap());
+
+    // Generation 2 supersedes it, back under the catalog's own layout.
+    table_writer
+        .write_table("public", "t", std::slice::from_ref(&batch))
+        .await
+        .unwrap();
+
+    // Expire generation 1: the row goes, and the object it named must be queued.
+    let expired = mgr
+        .expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![first.snapshot_id]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    let scheduled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        scheduled, 1,
+        "expire must schedule a file this catalog owns, however its path is spelled"
+    );
+
+    // Cleanup reclaims it.
+    let deleted = cleanup_old_files_in_catalog(
+        &mgr,
+        "cat_a",
+        Arc::clone(&object_store),
+        CleanupCriteria::All,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted, vec![own_file.to_str().unwrap().to_string()]);
+
+    // Nothing else can reach it: the orphan sweep lists only under data_path.
+    delete_orphaned_files_multicatalog(&mgr, object_store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert!(
+        !own_file.exists(),
+        "a file this catalog owns leaked: nothing in the catalog names it and no \
+         reclaim path reaches it"
+    );
+}
+
+/// Bootstrapping a store written before file ownership was recorded adds the column
+/// to all three file tables, leaves every existing row owned, and swaps the indexes.
+///
+/// The upgrade has to read the old rows correctly, not merely survive them. Before
+/// the column existed, an absolute path meant one thing — "my file, spelled
+/// absolutely" — so NULL, which is what `ADD COLUMN` gives every existing row, is
+/// exactly that meaning carried forward. A row that came back as a *reference*
+/// instead would lose its reclaim path, which is the defect this column fixes.
+///
+/// The fixture here can only produce owned rows, so this asserts one direction only.
+/// The other direction — a row written while #309 was on `main`, where absolute DID
+/// mean reference, and which this migration therefore also reads as owned — is
+/// covered by
+/// `cleanup_refuses_an_object_in_another_catalogs_layout_however_it_was_scheduled`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn bootstrapping_a_pre_ownership_store_leaves_every_file_owned() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    wa.set_data_path(data.to_str().unwrap()).unwrap();
+
+    // One generation outside data_path (absolute, owned), superseded by one inside.
+    let own_file = outside.join("own.parquet");
+    std::fs::write(&own_file, b"own").unwrap();
+    let table_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::write(table_dir.join("f2.parquet"), b"f2").unwrap();
+    let g1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap1 = wa
+        .register_data_file(
+            g1.table_id,
+            "public",
+            "t",
+            g1.snapshot_id,
+            &DataFileInfo::new(own_file.to_str().unwrap(), 3, 5).with_absolute_path(),
+            WriteMode::Replace,
+            g1.base_snapshot_id,
+            &cols(),
+            &g1.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+    let g2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        g2.table_id,
+        "public",
+        "t",
+        g2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 2, 5),
+        WriteMode::Replace,
+        g2.base_snapshot_id,
+        &cols(),
+        &g2.column_ids,
+    )
+    .unwrap();
+
+    // Rewind the store to the pre-ownership shape: no column anywhere, and the
+    // relativity-keyed indexes the reference lookup used to be served by. Dropping
+    // the column takes the partial indexes over it with it, so the explicit DROPs
+    // below are belt-and-braces.
+    for stmt in [
+        "ALTER TABLE ducklake_data_file DROP COLUMN owner_catalog_id",
+        "ALTER TABLE ducklake_delete_file DROP COLUMN owner_catalog_id",
+        "ALTER TABLE ducklake_files_scheduled_for_deletion DROP COLUMN scheduled_by_owner",
+        "CREATE INDEX idx_data_file_absolute_path
+         ON ducklake_data_file(path) WHERE NOT path_is_relative",
+        "CREATE INDEX idx_delete_file_absolute_path
+         ON ducklake_delete_file(path) WHERE NOT path_is_relative",
+        "DROP INDEX IF EXISTS idx_data_file_owner_catalog",
+        "DROP INDEX IF EXISTS idx_delete_file_owner_catalog",
+    ] {
+        sqlx::query(AssertSqlSafe(stmt))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // The upgrade, twice: it runs on every boot, so it has to be idempotent.
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    initialize_multicatalog_schema(&pool).await.unwrap();
+
+    let unowned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unowned, 0,
+        "a row that predates the column is this catalog's own, not a reference"
+    );
+    let index_names: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes
+         WHERE indexname LIKE 'idx_%_file_%' ORDER BY indexname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        index_names.contains(&"idx_data_file_owner_catalog".to_string())
+            && index_names.contains(&"idx_delete_file_owner_catalog".to_string()),
+        "the reference indexes are created on upgrade: {index_names:?}"
+    );
+    assert!(
+        !index_names.contains(&"idx_data_file_absolute_path".to_string())
+            && !index_names.contains(&"idx_delete_file_absolute_path".to_string()),
+        "the relativity-keyed indexes are dropped on upgrade: {index_names:?}"
+    );
+
+    // And the upgraded row keeps its reclaim path: scheduled, then deleted.
+    mgr.expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![snap1]))
+        .await
+        .unwrap();
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, vec![own_file.to_str().unwrap().to_string()]);
+    assert!(!own_file.exists(), "the upgraded row's object is reclaimed");
+}
+
+/// Both ways of getting ownership wrong are refused at registration.
+///
+/// Naming the registering catalog reads as "a reference to my own file", which nothing
+/// reclaims: no catalog schedules a reference, and the cleanup that would have
+/// reclaimed it is this very catalog, deferring against its own row.
+///
+/// A reference with a relative path is the worse one, because it deletes rather than
+/// leaks: the owner's cleanup compares the stored path against its own resolved key,
+/// a relative spelling never matches, and the owner reclaims the object while this row
+/// still names it. Both are caught where the caller can still fix them.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_rejects_malformed_ownership() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("self_owner").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let ids = vec![1_i64, 2_i64];
+
+    let other = cat + 1000;
+    for (case, file, delete, expected) in [
+        (
+            "data file naming its own catalog",
+            DataFileInfo::new("/elsewhere/f1.parquet", 8, 1)
+                .with_absolute_path()
+                .with_owner_catalog(cat),
+            None,
+            "is this catalog",
+        ),
+        (
+            "delete file naming its own catalog",
+            DataFileInfo::new("/elsewhere/f2.parquet", 8, 1).with_absolute_path(),
+            Some(
+                DeleteFileInfo::new("/elsewhere/d2.parquet", 4, 1)
+                    .with_absolute_path()
+                    .with_owner_catalog(cat),
+            ),
+            "is this catalog",
+        ),
+        (
+            "data file referencing another catalog with a relative path",
+            DataFileInfo::new("f3.parquet", 8, 1).with_owner_catalog(other),
+            None,
+            "path is relative",
+        ),
+        (
+            "delete file referencing another catalog with a relative path",
+            DataFileInfo::new("/elsewhere/f4.parquet", 8, 1)
+                .with_absolute_path()
+                .with_owner_catalog(other),
+            Some(DeleteFileInfo::new("d4.parquet", 4, 1).with_owner_catalog(other)),
+            "path is relative",
+        ),
+    ] {
+        let err = w
+            .register_existing_data_file_with_delete(
+                "public",
+                "t",
+                &cols(),
+                &ids,
+                &file,
+                delete.as_ref(),
+                WriteMode::Append,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(expected),
+            "{case}: expected {expected:?}, got: {err}"
+        );
+    }
+
+    // Nothing was committed by any attempt.
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 0);
+}
+
+/// A reference row written before the ownership column existed must not let the
+/// referring catalog reclaim the owner's live file.
+///
+/// The migration gives every pre-existing row `owner_catalog_id = NULL`, i.e. owned.
+/// That is the right reading for a row written before #309, when an absolute path
+/// meant only "spelled absolutely" — and the WRONG one for a row written while #309
+/// was on `main`, where absolute genuinely meant reference. Such a row now reads as
+/// the referring catalog's own, so its expire schedules the owner's object and
+/// stamps the scheduled row as its own to reclaim.
+///
+/// The stamp is what makes this unrecoverable if the guard trusts it: the fail-closed
+/// layout check that would refuse an object outside the cleaning catalog's `cat_{id}/`
+/// is skipped precisely because the new code scheduled the row. So the guard must
+/// refuse an object sitting in ANOTHER catalog's layout however the row was scheduled.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_refuses_an_object_in_another_catalogs_layout_however_it_was_scheduled() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    // A owns f1 and never retires it: it stays live for A's readers throughout.
+    let a_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("f1.parquet"), b"f1").unwrap();
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a1.table_id,
+        "public",
+        "t",
+        a1.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 2, 5),
+        WriteMode::Replace,
+        a1.base_snapshot_id,
+        &cols(),
+        &a1.column_ids,
+    )
+    .unwrap();
+
+    // B holds a #309-era reference to it. After the migration such a row is exactly
+    // this: absolute path, no owner recorded. `with_absolute_path` alone reproduces
+    // that shape without needing to rewind the schema.
+    let (_, base) = parse_object_store_url(&data_str).unwrap();
+    let f1_abs = join_paths(&base, &format!("cat_{cat_a}/public/t/f1.parquet")).unwrap();
+    let b1 = wb
+        .register_existing_data_file(
+            "public",
+            "t",
+            &cols(),
+            &a1.column_ids,
+            &DataFileInfo::new(f1_abs.clone(), 2, 5).with_absolute_path(),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    let owner: Option<i64> =
+        sqlx::query_scalar("SELECT owner_catalog_id FROM ducklake_data_file WHERE table_id = $1")
+            .bind(b1.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        owner, None,
+        "the fixture must be the post-migration shape, or this test proves nothing"
+    );
+
+    // B moves on to a file of its own, so the reference row dies in B and its expire
+    // retires it.
+    let b_dir = data.join(format!("cat_{cat_b}")).join("public").join("t");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    std::fs::write(b_dir.join("b_own.parquet"), b"bb").unwrap();
+    wb.register_existing_data_file(
+        "public",
+        "t",
+        &cols(),
+        &a1.column_ids,
+        &DataFileInfo::new("b_own.parquet", 2, 5),
+        WriteMode::Replace,
+    )
+    .unwrap();
+    mgr.expire_snapshots_in_catalog("cat_b", ExpireCriteria::Versions(vec![b1.snapshot_id]))
+        .await
+        .unwrap();
+
+    // Whatever B scheduled, cleanup must not delete an object under cat_a's layout.
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_b", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert!(
+        !deleted.contains(&f1_abs),
+        "B reclaimed a file in cat_a's layout: {deleted:?}"
+    );
+    assert!(
+        a_dir.join("f1.parquet").exists(),
+        "A's live file was destroyed by B's cleanup"
+    );
+}
+
+/// A catalog's own absolute-path file survives a sweep of its own root.
+///
+/// The cross-catalog arm of the sweep collects reference rows only, not every
+/// absolutely-spelled row, so this is the claim that makes that narrowing sound: a
+/// catalog's OWN absolute file is already reached by the scoped arms whenever its
+/// catalog is in the swept group, because `PG_RESOLVED_PATH` short-circuits to the
+/// stored path. Without that, narrowing the wider arm would hand the sweep a live
+/// file to delete.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn orphan_sweep_keeps_a_catalogs_own_absolute_file_under_its_own_root() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_in_data_path};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    wa.set_data_path(root.to_str().unwrap()).unwrap();
+
+    // One live file of A's own, registered with an ABSOLUTE path under A's own root,
+    // and one genuine orphan beside it.
+    let dir = root.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mine.parquet"), b"mine").unwrap();
+    std::fs::write(dir.join("stray.parquet"), b"stray").unwrap();
+    let abs = dir.join("mine.parquet").to_str().unwrap().to_string();
+    let setup = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        setup.table_id,
+        "public",
+        "t",
+        setup.snapshot_id,
+        &DataFileInfo::new(abs, 4, 5).with_absolute_path(),
+        WriteMode::Replace,
+        setup.base_snapshot_id,
+        &cols(),
+        &setup.column_ids,
+    )
+    .unwrap();
+    let owner: Option<i64> = sqlx::query_scalar("SELECT owner_catalog_id FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, None, "A's own file, absolute but owned");
+
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_in_data_path(
+        &mgr,
+        root.to_str().unwrap(),
+        os,
+        CleanupCriteria::All,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        dir.join("mine.parquet").exists(),
+        "the sweep deleted a live file this catalog owns: {deleted:?}"
+    );
+    assert!(!dir.join("stray.parquet").exists(), "the orphan is gone");
 }
