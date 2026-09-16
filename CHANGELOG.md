@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ORDER BY col LIMIT n` skips data files whose statistics cannot beat the
+  running Top-N boundary, including scans that rename columns or project
+  `rowid`. Prunes in some cases official DuckLake does not; results are
+  unchanged (#316).
 - Catalog-inlined scans push safe equality, range, null, boolean, and prefix
   filters into metadata queries, retaining DataFusion residual filters (#277).
 
