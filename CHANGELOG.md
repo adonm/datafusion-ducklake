@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A promoted file keeps the column statistics it is handed and the table roll-up is rebuilt
+  from them in the same commit; a stat for a column outside the adopted ids is refused (#333).
 - Concurrent catalog lookups no longer deadlock the caller's tokio runtime, and a lookup through
   a pool this crate opened — `SqliteMetadataProvider::new`, `PostgresMetadataProvider::new`,
   `MySqlMetadataProvider::new`, or a metadata writer's constructor — runs under a
